@@ -26,6 +26,12 @@ pub enum PlaybackError {
 pub trait AudioBackend: Send + 'static {
     fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), PlaybackError>;
     fn write_interleaved_f32(&mut self, samples: &[f32]) -> Result<(), PlaybackError>;
+    /// Closes the input stream so buffered audio can play out cleanly without killing the backend.
+    fn begin_drain(&mut self) {}
+    /// Returns `true` once any draining backend process has exited.
+    fn poll_drained(&mut self) -> bool {
+        true
+    }
     fn stop(&mut self);
     fn name(&self) -> &'static str;
 }
@@ -63,6 +69,7 @@ impl PipeTool {
         let ch = channels.to_string();
         match self {
             Self::PwPlay => vec![
+                "--raw".to_string(),
                 "--rate".to_string(),
                 sr,
                 "--channels".to_string(),
@@ -253,6 +260,23 @@ impl AudioBackend for SystemPipeBackend {
             .map_err(|e| PlaybackError::WriteFailed(e.to_string()))
     }
 
+    fn begin_drain(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    fn poll_drained(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return true;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => {
+                self.child = None;
+                true
+            }
+            Ok(None) => false,
+        }
+    }
+
     fn stop(&mut self) {
         // Drop stdin first so the child sees EOF, then kill/reap to avoid leaking zombies.
         drop(self.stdin.take());
@@ -284,6 +308,7 @@ pub struct NullBackendLog {
     pub chunks: Vec<Vec<f32>>,
     pub open_count: usize,
     pub stop_count: usize,
+    pub drain_count: usize,
     pub last_config: Option<(u32, u16)>,
 }
 
@@ -306,6 +331,8 @@ pub struct NullAudioBackend {
     paced: bool,
     sample_rate: u32,
     channels: u16,
+    drain_polls_before_done: usize,
+    remaining_drain_polls: usize,
 }
 
 impl NullAudioBackend {
@@ -319,6 +346,8 @@ impl NullAudioBackend {
             paced: false,
             sample_rate: 0,
             channels: 0,
+            drain_polls_before_done: 0,
+            remaining_drain_polls: 0,
         }
     }
 
@@ -329,12 +358,21 @@ impl NullAudioBackend {
             paced: false,
             sample_rate: 0,
             channels: 0,
+            drain_polls_before_done: 0,
+            remaining_drain_polls: 0,
         }
     }
 
     /// Enables or disables real-time sleep pacing per written chunk.
     pub fn with_paced(mut self, paced: bool) -> Self {
         self.paced = paced;
+        self
+    }
+
+    /// Configures how many `poll_drained()` calls return `false` after `begin_drain()` before
+    /// reporting `true`.
+    pub fn with_drain_polls_before_done(mut self, polls: usize) -> Self {
+        self.drain_polls_before_done = polls;
         self
     }
 
@@ -359,6 +397,7 @@ impl AudioBackend for NullAudioBackend {
         }
         self.sample_rate = sample_rate;
         self.channels = channels;
+        self.remaining_drain_polls = 0;
         if let Ok(mut guard) = self.log.lock() {
             guard.open_count += 1;
             guard.last_config = Some((sample_rate, channels));
@@ -380,7 +419,24 @@ impl AudioBackend for NullAudioBackend {
         Ok(())
     }
 
+    fn begin_drain(&mut self) {
+        self.remaining_drain_polls = self.drain_polls_before_done;
+        if let Ok(mut guard) = self.log.lock() {
+            guard.drain_count += 1;
+        }
+    }
+
+    fn poll_drained(&mut self) -> bool {
+        if self.remaining_drain_polls > 0 {
+            self.remaining_drain_polls -= 1;
+            false
+        } else {
+            true
+        }
+    }
+
     fn stop(&mut self) {
+        self.remaining_drain_polls = 0;
         if let Ok(mut guard) = self.log.lock() {
             guard.stop_count += 1;
         }
@@ -419,6 +475,7 @@ mod tests {
         assert_eq!(
             PipeTool::PwPlay.args(48000, 2),
             vec![
+                "--raw",
                 "--rate",
                 "48000",
                 "--channels",

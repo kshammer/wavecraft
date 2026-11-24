@@ -1114,4 +1114,60 @@ mod tests {
             assert!(ogg_tree.validate_ranges(input.len()));
         }
     }
+
+    /// Valid 16-bit mono 44100 Hz 64-frame 440 Hz sine FLAC generated via `ffmpeg`
+    /// with padding stripped and STREAMINFO marked as the last metadata block.
+    const VALID_MINI_FLAC: &[u8] = &[
+        0x66, 0x4C, 0x61, 0x43, 0x80, 0x00, 0x00, 0x22, 0x12, 0x00, 0x12, 0x00, 0x00, 0x00, 0x55,
+        0x00, 0x00, 0x55, 0x0A, 0xC4, 0x40, 0xF0, 0x00, 0x00, 0x00, 0x40, 0x3B, 0xAE, 0x50, 0xDB,
+        0xDE, 0xCE, 0xA9, 0x75, 0x9C, 0x86, 0x6B, 0x14, 0xA0, 0xB0, 0xA0, 0x93, 0xFF, 0xF8, 0x69,
+        0x08, 0x00, 0x3F, 0xA0, 0x4E, 0x00, 0x00, 0x01, 0x00, 0x01, 0xFF, 0x02, 0xFD, 0x03, 0xF8,
+        0x04, 0xEE, 0x05, 0xE0, 0x06, 0xCC, 0xE6, 0x2C, 0x9F, 0x96, 0xE4, 0xAC, 0x22, 0xF0, 0x49,
+        0x93, 0x1D, 0xEF, 0x21, 0xFA, 0xFF, 0x1C, 0x00, 0x8F, 0x12, 0x20, 0x40, 0x81, 0x02, 0x04,
+        0x1C, 0x24, 0xF3, 0x44, 0x16, 0x20, 0xA3, 0x4A, 0x2C, 0x92, 0x48, 0x7B, 0xDC, 0xA7, 0x23,
+        0xAA, 0xDB, 0x30, 0xCE, 0x6F, 0xDF, 0xFD, 0x3D, 0xBB, 0xB7, 0xD1, 0x6D, 0x96, 0xD9, 0x75,
+        0xD6, 0xDF, 0x6D, 0xF6, 0xC0, 0x63, 0x81,
+    ];
+
+    #[test]
+    fn inspect_compressed_and_inspect_bytes_decode_valid_mini_flac() {
+        let inspected = inspect_compressed(VALID_MINI_FLAC.to_vec(), AudioFormat::Flac).unwrap();
+        assert_eq!(inspected.format, AudioFormat::Flac);
+        assert_eq!(inspected.metadata.sample_rate, 44_100);
+        assert_eq!(inspected.metadata.num_channels, 1);
+        assert_eq!(inspected.buffer.num_frames(), 64);
+        assert!(
+            inspected.buffer.channels[0].iter().any(|&s| s.abs() > 1e-4),
+            "decoded FLAC sine should contain non-zero PCM samples"
+        );
+        assert!(inspected.tree.validate_ranges(inspected.raw_bytes.len()));
+
+        let via_bytes = crate::format::inspect_bytes(VALID_MINI_FLAC.to_vec(), None, None).unwrap();
+        assert_eq!(via_bytes.format, AudioFormat::Flac);
+        assert_eq!(via_bytes.metadata.sample_rate, 44_100);
+        assert_eq!(via_bytes.metadata.num_channels, 1);
+        assert_eq!(via_bytes.buffer.num_frames(), 64);
+        assert!(via_bytes.tree.validate_ranges(via_bytes.raw_bytes.len()));
+    }
+
+    #[test]
+    fn inspect_compressed_returns_err_on_truncated_and_garbage_inputs() {
+        let invalid_inputs: [&[u8]; 4] = [
+            &[],
+            b"fLaC\x80\x00\x00\x22\x00\x00",
+            b"ID3\x03\x00\x00\x00\x00\x00\x00",
+            &[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04],
+        ];
+
+        for format in [AudioFormat::Flac, AudioFormat::Mp3, AudioFormat::Ogg] {
+            for input in invalid_inputs {
+                let res = inspect_compressed(input.to_vec(), format);
+                assert!(
+                    res.is_err(),
+                    "expected Err for {format:?} on {} invalid bytes",
+                    input.len()
+                );
+            }
+        }
+    }
 }

@@ -144,6 +144,13 @@ pub fn encode_raw_pcm(buffer: &AudioBuffer, cfg: RawPcmConfig) -> Result<Vec<u8>
     if buffer.num_channels() == 0 {
         return Err(CoreError::EmptyBuffer);
     }
+    if cfg.num_channels as usize != buffer.num_channels() {
+        return Err(CoreError::InvalidChannelLayout(format!(
+            "raw PCM config specifies {} channels, but buffer has {}",
+            cfg.num_channels,
+            buffer.num_channels()
+        )));
+    }
     let bytes_per_sample = (cfg.encoding.bits_per_sample() / 8) as usize;
     let num_frames = buffer.num_frames();
     let mut out = Vec::with_capacity(num_frames * buffer.num_channels() * bytes_per_sample);
@@ -230,5 +237,18 @@ mod tests {
         };
         let err = inspect_raw_pcm(vec![0x01, 0x02, 0x03], cfg);
         assert!(matches!(err, Err(CoreError::MalformedFile(_))));
+    }
+
+    #[test]
+    fn encode_raw_pcm_rejects_channel_mismatch() {
+        let buf = AudioBuffer::new_silent(44_100, 2, 16);
+        let cfg = RawPcmConfig {
+            sample_rate: 44_100,
+            num_channels: 1,
+            encoding: SampleEncoding::PcmI16,
+            big_endian: false,
+        };
+        let err = encode_raw_pcm(&buf, cfg);
+        assert!(matches!(err, Err(CoreError::InvalidChannelLayout(_))));
     }
 }

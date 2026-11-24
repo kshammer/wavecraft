@@ -431,7 +431,7 @@ impl EditableAudio {
 
         for i in clamped {
             let win_start = i.saturating_sub(radius);
-            let win_end = (i + radius + 1).min(num_frames);
+            let win_end = i.saturating_add(radius).saturating_add(1).min(num_frames);
             let count = (win_end - win_start) as f64;
             let sum: f64 = snapshot[win_start..win_end].iter().map(|&s| s as f64).sum();
             target[i] = sanitize_sample((sum / count) as f32);
@@ -658,6 +658,10 @@ mod tests {
         assert!((ch[1] - 1.0 / 3.0).abs() < 1e-6);
         assert!((ch[2] - 1.0 / 3.0).abs() < 1e-6);
         assert!((ch[3] - 1.0 / 3.0).abs() < 1e-6);
+
+        // Edge case: large radius must saturate cleanly without overflow.
+        editable.smooth_range_raw(0, 0..5, usize::MAX);
+        assert!(editable.buffer().channels[0].iter().all(|s| s.is_finite()));
     }
 
     #[test]

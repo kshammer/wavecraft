@@ -3,8 +3,9 @@ pub mod pipe_backend;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use wavecraft_core::AudioBuffer;
 
@@ -177,6 +178,7 @@ struct PlaybackWorker<B: AudioBackend> {
     stream_open: bool,
     open_config: Option<(u32, u16)>,
     playing: bool,
+    draining: bool,
     playhead: usize,
     loop_range: Option<Range<usize>>,
     volume: f32,
@@ -191,6 +193,7 @@ impl<B: AudioBackend> PlaybackWorker<B> {
             stream_open: false,
             open_config: None,
             playing: false,
+            draining: false,
             playhead: 0,
             loop_range: None,
             volume: 1.0,
@@ -199,12 +202,32 @@ impl<B: AudioBackend> PlaybackWorker<B> {
 
     fn run(&mut self, rx: Receiver<PlaybackCommand>) {
         loop {
-            if self.playing {
+            if self.draining {
+                match rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(cmd) => {
+                        if matches!(self.handle_command(cmd), LoopControl::Shutdown) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        self.shutdown();
+                        break;
+                    }
+                }
+                if self.draining && self.backend.poll_drained() {
+                    self.draining = false;
+                    self.stream_open = false;
+                    self.open_config = None;
+                    self.set_playing(false);
+                    self.set_playhead(0);
+                }
+            } else if self.playing {
                 match self.drain_commands(&rx) {
                     LoopControl::Continue => {}
                     LoopControl::Shutdown => break,
                 }
-                if self.playing {
+                if self.playing && !self.draining {
                     self.step_playback();
                 }
             } else {
@@ -241,6 +264,24 @@ impl<B: AudioBackend> PlaybackWorker<B> {
     }
 
     fn handle_command(&mut self, cmd: PlaybackCommand) -> LoopControl {
+        if self.draining
+            && matches!(
+                cmd,
+                PlaybackCommand::Pause
+                    | PlaybackCommand::Stop
+                    | PlaybackCommand::TogglePlayPause
+                    | PlaybackCommand::Seek(_)
+                    | PlaybackCommand::Play
+                    | PlaybackCommand::SetBuffer(_)
+            )
+        {
+            self.draining = false;
+            self.close_stream();
+            if matches!(cmd, PlaybackCommand::Play) {
+                self.set_playing(false);
+            }
+        }
+
         match cmd {
             PlaybackCommand::SetBuffer(buf) => self.on_set_buffer(buf),
             PlaybackCommand::Play => self.on_play(),
@@ -273,6 +314,7 @@ impl<B: AudioBackend> PlaybackWorker<B> {
     }
 
     fn shutdown(&mut self) {
+        self.draining = false;
         self.set_playing(false);
         self.stream_open = false;
         self.open_config = None;
@@ -448,9 +490,9 @@ impl<B: AudioBackend> PlaybackWorker<B> {
             if let Some(loop_start) = wrap_target {
                 self.set_playhead(loop_start);
             } else {
-                self.set_playing(false);
-                self.close_stream();
-                self.set_playhead(0);
+                self.set_playhead(end);
+                self.draining = true;
+                self.backend.begin_drain();
             }
         } else {
             self.set_playhead(end);
@@ -514,7 +556,7 @@ mod tests {
 
         let finished = wait_until(Duration::from_secs(2), || {
             let guard = log.lock().unwrap();
-            guard.stop_count >= 1 && !engine.state().is_playing()
+            guard.drain_count >= 1 && !engine.state().is_playing()
         });
         assert!(finished, "playback did not finish within timeout");
 
@@ -523,6 +565,8 @@ mod tests {
 
         let guard = log.lock().unwrap();
         assert_eq!(guard.open_count, 1);
+        assert_eq!(guard.drain_count, 1);
+        assert_eq!(guard.stop_count, 0);
         assert_eq!(guard.last_config, Some((44100, 2)));
         assert_eq!(guard.chunks.len(), 2);
         assert_eq!(guard.chunks[0].len(), 512 * 2);
@@ -545,11 +589,13 @@ mod tests {
 
         let finished = wait_until(Duration::from_secs(2), || {
             let guard = log.lock().unwrap();
-            guard.stop_count >= 1 && !engine.state().is_playing()
+            guard.drain_count >= 1 && !engine.state().is_playing()
         });
         assert!(finished, "seek playback did not finish within timeout");
 
         let guard = log.lock().unwrap();
+        assert_eq!(guard.drain_count, 1);
+        assert_eq!(guard.stop_count, 0);
         assert_eq!(guard.all_samples(), expected);
     }
 
@@ -666,5 +712,85 @@ mod tests {
         let guard = log.lock().unwrap();
         assert!(!guard.chunks.is_empty());
         assert!(guard.chunks[0].iter().all(|&s| (s - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn natural_eof_drains_without_stop_until_poll_drained_completes() {
+        let backend = NullAudioBackend::new().with_drain_polls_before_done(3);
+        let log = backend.log();
+        let engine = PlaybackEngine::with_backend(backend);
+
+        let buf = make_stereo_buffer(44100, 200);
+        engine.set_buffer(buf);
+        engine.play();
+
+        let drained = wait_until(Duration::from_secs(2), || {
+            let guard = log.lock().unwrap();
+            guard.drain_count == 1 && !engine.state().is_playing()
+        });
+        assert!(drained, "natural EOF did not finish draining");
+
+        let guard = log.lock().unwrap();
+        assert_eq!(guard.drain_count, 1);
+        assert_eq!(guard.stop_count, 0);
+        assert_eq!(engine.state().playhead_frame(), 0);
+    }
+
+    #[test]
+    fn stop_and_pause_while_draining_abort_immediately_via_stop() {
+        // Explicit Stop interrupts draining immediately.
+        {
+            let backend = NullAudioBackend::new().with_drain_polls_before_done(1000);
+            let log = backend.log();
+            let engine = PlaybackEngine::with_backend(backend);
+
+            engine.set_buffer(make_stereo_buffer(44100, 200));
+            engine.play();
+
+            assert!(
+                wait_until(Duration::from_secs(2), || {
+                    log.lock().unwrap().drain_count == 1
+                }),
+                "engine did not enter draining state"
+            );
+            assert!(engine.state().is_playing());
+
+            engine.stop();
+            assert!(
+                wait_until(Duration::from_secs(1), || {
+                    let guard = log.lock().unwrap();
+                    guard.stop_count == 1 && !engine.state().is_playing()
+                }),
+                "stop did not immediately abort draining"
+            );
+            assert_eq!(engine.state().playhead_frame(), 0);
+        }
+
+        // Explicit Pause interrupts draining immediately.
+        {
+            let backend = NullAudioBackend::new().with_drain_polls_before_done(1000);
+            let log = backend.log();
+            let engine = PlaybackEngine::with_backend(backend);
+
+            engine.set_buffer(make_stereo_buffer(44100, 200));
+            engine.play();
+
+            assert!(
+                wait_until(Duration::from_secs(2), || {
+                    log.lock().unwrap().drain_count == 1
+                }),
+                "engine did not enter draining state"
+            );
+            assert!(engine.state().is_playing());
+
+            engine.pause();
+            assert!(
+                wait_until(Duration::from_secs(1), || {
+                    let guard = log.lock().unwrap();
+                    guard.stop_count == 1 && !engine.state().is_playing()
+                }),
+                "pause did not immediately abort draining"
+            );
+        }
     }
 }
