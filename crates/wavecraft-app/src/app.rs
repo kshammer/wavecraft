@@ -136,6 +136,96 @@ impl WavecraftApp {
         app
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_tests() -> Self {
+        use crate::ui::explorer::{DirEntryInfo, PreviewState};
+        use wavecraft_core::format::{inspect_bytes, wav::encode_wav};
+        use wavecraft_core::{AudioFormat, PeakBucket};
+
+        let default_buf = make_sine_440_buffer(44_100, 2, 1.0);
+        let wav_bytes =
+            encode_wav(&default_buf, SampleEncoding::PcmI16).expect("test WAV encode must succeed");
+        let inspected = inspect_bytes(wav_bytes, Some(Path::new("test_stereo_440hz.wav")), None)
+            .expect("test WAV inspect must succeed");
+        let sample_meta = inspected.metadata.clone();
+        let engine = PlaybackEngine::with_backend(wavecraft_audio::NullAudioBackend::new());
+
+        let mut explorer = ExplorerState::new(PathBuf::from("__wavecraft_test_no_fs__"));
+        explorer.path_input = "/workspace/wavecraft/samples/stereo_session_long_path".to_string();
+        let wav_path = PathBuf::from("test_stereo_440hz_long_filename_sample.wav");
+        let flac_path = PathBuf::from("piano_chord_c_major_extended_take_04.flac");
+        explorer.entries = vec![
+            DirEntryInfo {
+                path: PathBuf::from("subfolder_stems"),
+                name: "subfolder_stems".to_string(),
+                is_dir: true,
+                size_bytes: 0,
+                format: None,
+            },
+            DirEntryInfo {
+                path: wav_path.clone(),
+                name: "test_stereo_440hz_long_filename_sample.wav".to_string(),
+                is_dir: false,
+                size_bytes: inspected.raw_bytes.len() as u64,
+                format: Some(AudioFormat::Wav),
+            },
+            DirEntryInfo {
+                path: flac_path.clone(),
+                name: "piano_chord_c_major_extended_take_04.flac".to_string(),
+                is_dir: false,
+                size_bytes: 262_144,
+                format: Some(AudioFormat::Flac),
+            },
+        ];
+        explorer.previews.clear();
+        let dummy_peaks = vec![
+            PeakBucket {
+                min: -0.6,
+                max: 0.6
+            };
+            64
+        ];
+        explorer.previews.insert(
+            wav_path.clone(),
+            PreviewState::Ready {
+                metadata: sample_meta.clone(),
+                peaks: dummy_peaks.clone(),
+            },
+        );
+        explorer.previews.insert(
+            flac_path,
+            PreviewState::Ready {
+                metadata: sample_meta,
+                peaks: dummy_peaks,
+            },
+        );
+        explorer.selected_file = Some(wav_path);
+
+        let app = Self {
+            current_path: Some(PathBuf::from("test_stereo_440hz.wav")),
+            inspected: Some(inspected),
+            editable: EditableAudio::new(default_buf),
+            engine,
+            selection: None,
+            active_channel: None,
+            volume: 0.85,
+            loop_enabled: false,
+            show_explorer: true,
+            show_inspector: true,
+            explorer,
+            inspector: InspectorState::default(),
+            waveform: WaveformViewState::default(),
+            tuner: TunerState::default(),
+            modal: None,
+            last_live_audio_sync: None,
+            pending_live_audio_flush: false,
+            status_message: "Ready — Test Stereo 440 Hz Buffer".to_string(),
+        };
+        app.engine.set_volume(app.volume);
+        app.sync_engine_buffer();
+        app
+    }
+
     /// Pushes the current [`EditableAudio`] buffer to the [`PlaybackEngine`] and updates loop bounds.
     pub fn sync_engine_buffer(&self) {
         self.engine
@@ -888,10 +978,9 @@ impl WavecraftApp {
             self.modal = Some(modal);
         }
     }
-}
 
-impl eframe::App for WavecraftApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Runs one frame of the Wavecraft UI against `ctx` (shared by `eframe::App::update` and headless tests).
+    pub(crate) fn render_ui(&mut self, ctx: &egui::Context) {
         self.handle_shortcuts(ctx);
 
         if self.pending_live_audio_flush {
@@ -971,10 +1060,35 @@ impl eframe::App for WavecraftApp {
                 });
         }
 
+        egui::TopBottomPanel::bottom("status_bar")
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let dirty_tag = if self.editable.is_dirty() {
+                        " [modified]"
+                    } else {
+                        ""
+                    };
+                    let file_label = self.current_path.as_ref().map_or_else(
+                        || "<unsaved buffer>".to_string(),
+                        |p| p.display().to_string(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{file_label}{dirty_tag}  •  {}",
+                            self.status_message
+                        ))
+                        .size(11.5)
+                        .color(Color32::from_rgb(148, 163, 184)),
+                    );
+                });
+            });
+
+        let max_bottom_h = (ctx.screen_rect().height() * 0.60).max(180.0);
         egui::TopBottomPanel::bottom("bottom_panel")
             .resizable(true)
             .default_height(245.0)
-            .min_height(150.0)
+            .height_range(140.0..=max_bottom_h)
             .show(ctx, |ui| {
                 let playhead = self.engine.state().playhead_frame();
                 let is_looping_and_playing = self.loop_enabled && self.engine.state().is_playing();
@@ -1012,26 +1126,6 @@ impl eframe::App for WavecraftApp {
                         self.status_message = msg;
                     }
                 }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let dirty_tag = if self.editable.is_dirty() {
-                        " [modified]"
-                    } else {
-                        ""
-                    };
-                    let file_label = self.current_path.as_ref().map_or_else(
-                        || "<unsaved buffer>".to_string(),
-                        |p| p.display().to_string(),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{file_label}{dirty_tag}  •  {}",
-                            self.status_message
-                        ))
-                        .size(11.5)
-                        .color(Color32::from_rgb(148, 163, 184)),
-                    );
-                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1089,6 +1183,12 @@ impl eframe::App for WavecraftApp {
     }
 }
 
+impl eframe::App for WavecraftApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_ui(ctx);
+    }
+}
+
 /// Clamps a frame `selection` to `[0, num_frames]`, returning `None` if empty or out of bounds.
 pub fn clamp_selection(selection: Option<Range<usize>>, num_frames: usize) -> Option<Range<usize>> {
     selection.and_then(|sel| {
@@ -1141,6 +1241,7 @@ fn configure_theme(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::tuner_fft::BottomTab;
 
     #[test]
     fn clamp_selection_handles_valid_partial_oob_and_empty_ranges() {
@@ -1156,5 +1257,234 @@ mod tests {
         );
         assert_eq!(clamp_selection(Some(0..10), 0), None);
         assert_eq!(clamp_selection(None, 100), None);
+    }
+
+    fn base_raw_input(screen: egui::Rect) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FramePanelMetrics {
+        explorer_w: f32,
+        inspector_w: f32,
+        bottom_h: f32,
+        status_h: f32,
+        central_w: f32,
+        central_h: f32,
+    }
+
+    fn run_frame(
+        ctx: &egui::Context,
+        app: &mut WavecraftApp,
+        input: egui::RawInput,
+    ) -> FramePanelMetrics {
+        let mut central_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(input, |ctx| {
+            app.render_ui(ctx);
+            central_rect = ctx.available_rect();
+        });
+        let explorer_w =
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new("explorer_panel"))
+                .expect("explorer_panel PanelState must exist after render")
+                .rect
+                .width();
+        let inspector_w =
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new("inspector_panel"))
+                .expect("inspector_panel PanelState must exist after render")
+                .rect
+                .width();
+        let bottom_h =
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new("bottom_panel"))
+                .expect("bottom_panel PanelState must exist after render")
+                .rect
+                .height();
+        let status_h = egui::containers::panel::PanelState::load(ctx, egui::Id::new("status_bar"))
+            .expect("status_bar PanelState must exist after render")
+            .rect
+            .height();
+        FramePanelMetrics {
+            explorer_w,
+            inspector_w,
+            bottom_h,
+            status_h,
+            central_w: central_rect.width(),
+            central_h: central_rect.height(),
+        }
+    }
+
+    fn drag_pointer(
+        ctx: &egui::Context,
+        app: &mut WavecraftApp,
+        screen: egui::Rect,
+        start_pos: egui::Pos2,
+        end_pos: egui::Pos2,
+    ) {
+        let mut press_input = base_raw_input(screen);
+        press_input
+            .events
+            .push(egui::Event::PointerMoved(start_pos));
+        press_input.events.push(egui::Event::PointerButton {
+            pos: start_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = run_frame(ctx, app, press_input);
+
+        let mut drag_input = base_raw_input(screen);
+        drag_input.events.push(egui::Event::PointerMoved(end_pos));
+        let _ = run_frame(ctx, app, drag_input);
+
+        let mut release_input = base_raw_input(screen);
+        release_input.events.push(egui::Event::PointerButton {
+            pos: end_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = run_frame(ctx, app, release_input);
+    }
+
+    #[test]
+    fn all_panels_stay_stable_across_frames_and_resize_cleanly() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1440.0, 860.0));
+
+        for tab in BottomTab::ALL {
+            let ctx = egui::Context::default();
+            configure_theme(&ctx);
+            let mut app = WavecraftApp::new_for_tests();
+            app.tuner.active_tab = tab;
+
+            let mut frames = Vec::with_capacity(30);
+            for _frame in 1..=30 {
+                frames.push(run_frame(&ctx, &mut app, base_raw_input(screen)));
+            }
+
+            // Frames 2..=30 (indices 1..30) must remain stable with < 1.0px drift across all panels.
+            let base = frames[1];
+            for (idx, m) in frames[1..].iter().enumerate() {
+                let frame_num = idx + 2;
+                assert!(
+                    (m.bottom_h - base.bottom_h).abs() < 1.0,
+                    "tab {tab:?} frame {frame_num}: bottom_panel drifted to {} vs frame 2 ({})",
+                    m.bottom_h,
+                    base.bottom_h
+                );
+                assert!(
+                    m.bottom_h <= 250.0,
+                    "tab {tab:?} frame {frame_num}: bottom_panel too tall ({})",
+                    m.bottom_h
+                );
+                assert!(
+                    (m.explorer_w - base.explorer_w).abs() < 1.0,
+                    "tab {tab:?} frame {frame_num}: explorer_panel drifted to {} vs frame 2 ({})",
+                    m.explorer_w,
+                    base.explorer_w
+                );
+                assert!(
+                    m.explorer_w <= 280.0,
+                    "tab {tab:?} frame {frame_num}: explorer_panel expanded to {} (expected ~270.0)",
+                    m.explorer_w
+                );
+                assert!(
+                    (m.inspector_w - base.inspector_w).abs() < 1.0,
+                    "tab {tab:?} frame {frame_num}: inspector_panel drifted to {} vs frame 2 ({})",
+                    m.inspector_w,
+                    base.inspector_w
+                );
+                assert!(
+                    m.inspector_w <= 430.0,
+                    "tab {tab:?} frame {frame_num}: inspector_panel expanded to {} (expected ~420.0)",
+                    m.inspector_w
+                );
+                assert!(
+                    (m.status_h - base.status_h).abs() < 1.0,
+                    "tab {tab:?} frame {frame_num}: status_bar drifted to {} vs frame 2 ({})",
+                    m.status_h,
+                    base.status_h
+                );
+                assert!(
+                    m.central_w >= 500.0,
+                    "tab {tab:?} frame {frame_num}: CentralPanel too narrow ({})",
+                    m.central_w
+                );
+                assert!(
+                    m.central_h >= 350.0,
+                    "tab {tab:?} frame {frame_num}: CentralPanel too short ({})",
+                    m.central_h
+                );
+            }
+
+            // Simulate dragging the bottom_panel top resize edge downward to shrink it.
+            let bottom_rect =
+                egui::containers::panel::PanelState::load(&ctx, egui::Id::new("bottom_panel"))
+                    .expect("bottom_panel PanelState")
+                    .rect;
+            let drag_x = bottom_rect.center().x;
+            drag_pointer(
+                &ctx,
+                &mut app,
+                screen,
+                egui::Pos2::new(drag_x, bottom_rect.top()),
+                egui::Pos2::new(drag_x, bottom_rect.top() + 95.0),
+            );
+
+            // Settle frame after drag release, then verify 10 consecutive frames stay shrunk.
+            let shrunk = run_frame(&ctx, &mut app, base_raw_input(screen));
+            assert!(
+                shrunk.bottom_h < frames[29].bottom_h - 40.0,
+                "tab {tab:?}: expected drag to shrink bottom_panel below {}, got {}",
+                frames[29].bottom_h,
+                shrunk.bottom_h
+            );
+            assert!(
+                shrunk.bottom_h >= 139.0,
+                "tab {tab:?}: shrunk bottom_h ({}) should respect min height 140.0",
+                shrunk.bottom_h
+            );
+            assert!(
+                shrunk.central_h >= 350.0,
+                "tab {tab:?}: central panel after shrink ({})",
+                shrunk.central_h
+            );
+
+            for extra in 1..=10 {
+                let m = run_frame(&ctx, &mut app, base_raw_input(screen));
+                assert!(
+                    (m.bottom_h - shrunk.bottom_h).abs() < 1.0,
+                    "tab {tab:?} post-shrink frame {extra}: bottom_panel crept from {} to {}",
+                    shrunk.bottom_h,
+                    m.bottom_h
+                );
+                assert!(
+                    m.central_h >= 350.0,
+                    "tab {tab:?} post-shrink frame {extra}: CentralPanel too small ({})",
+                    m.central_h
+                );
+            }
+
+            // Simulate dragging the inspector_panel left resize edge rightward to shrink it toward 300.0.
+            let inspector_rect =
+                egui::containers::panel::PanelState::load(&ctx, egui::Id::new("inspector_panel"))
+                    .expect("inspector_panel PanelState")
+                    .rect;
+            let drag_y = inspector_rect.center().y;
+            drag_pointer(
+                &ctx,
+                &mut app,
+                screen,
+                egui::Pos2::new(inspector_rect.left(), drag_y),
+                egui::Pos2::new(inspector_rect.left() + 110.0, drag_y),
+            );
+            let shrunk_insp = run_frame(&ctx, &mut app, base_raw_input(screen));
+            assert!(
+                shrunk_insp.inspector_w < 340.0 && shrunk_insp.inspector_w >= 299.0,
+                "tab {tab:?}: expected inspector_panel to shrink toward 300.0, got {}",
+                shrunk_insp.inspector_w
+            );
+        }
     }
 }

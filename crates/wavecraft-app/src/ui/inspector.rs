@@ -289,7 +289,7 @@ pub fn show_inspector(
             .strong()
             .color(Color32::from_rgb(148, 163, 184)),
     );
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_salt("inspector_format_tree")
         .max_height(tree_height)
         .auto_shrink([false, false])
@@ -353,7 +353,7 @@ pub fn show_inspector(
     let char_w = ui.fonts(|f| f.glyph_width(&font_id, '0')).max(6.0);
     let row_height = 18.0_f32;
 
-    let mut scroll = egui::ScrollArea::vertical()
+    let mut scroll = egui::ScrollArea::both()
         .id_salt("inspector_hex_scroll")
         .auto_shrink([false, false]);
     if let Some(target_row) = state.scroll_to_row.take() {

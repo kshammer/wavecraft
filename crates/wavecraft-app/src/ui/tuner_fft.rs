@@ -425,6 +425,8 @@ pub fn show_tuner_fft_panel(
     ui.separator();
 
     egui::ScrollArea::vertical()
+        .id_salt("bottom_tuner_fft_scroll")
+        .max_height(ui.available_height().max(40.0))
         .auto_shrink([false, false])
         .show(ui, |ui| match state.active_tab {
             BottomTab::SpectrumFft => {
@@ -530,7 +532,7 @@ fn render_spectrum_tab(
 
     // Spectrum plot canvas
     let plot_w = ui.available_width().max(200.0);
-    let plot_h = ui.available_height().clamp(110.0, 220.0);
+    let plot_h = (ui.available_height() - 4.0).clamp(56.0, 220.0);
     let (plot_rect, response) = ui.allocate_exact_size(Vec2::new(plot_w, plot_h), Sense::hover());
     let painter = ui.painter_at(plot_rect);
 

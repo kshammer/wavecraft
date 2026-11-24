@@ -344,15 +344,20 @@ pub fn show_explorer(ui: &mut egui::Ui, state: &mut ExplorerState) -> ExplorerAc
         {
             state.refresh();
         }
-        let path_edit = ui.add(
-            egui::TextEdit::singleline(&mut state.path_input)
-                .desired_width(ui.available_width() - 38.0),
-        );
-        let enter_pressed = path_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if ui.button("Go").clicked() || enter_pressed {
-            let target = PathBuf::from(state.path_input.trim());
-            state.navigate_to(target);
-        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let go_clicked = ui.button("Go").clicked();
+            let text_w = ui.available_width().max(40.0);
+            let text_resp = ui.add_sized(
+                Vec2::new(text_w, 22.0),
+                egui::TextEdit::singleline(&mut state.path_input).desired_width(text_w),
+            );
+            if go_clicked
+                || (text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            {
+                let target = PathBuf::from(state.path_input.trim());
+                state.navigate_to(target);
+            }
+        });
     });
 
     ui.add_space(4.0);
@@ -461,18 +466,6 @@ pub fn show_explorer(ui: &mut egui::Ui, state: &mut ExplorerState) -> ExplorerAc
                                 let (bg, fg) = format_badge_colors(fmt);
                                 draw_badge(ui, fmt.label(), bg, fg);
                             }
-                            let title_resp = ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&entry.name)
-                                        .strong()
-                                        .color(Color32::from_rgb(226, 232, 240)),
-                                )
-                                .truncate()
-                                .sense(Sense::click()),
-                            );
-                            if title_resp.clicked() {
-                                open_clicked = true;
-                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -488,6 +481,23 @@ pub fn show_explorer(ui: &mut egui::Ui, state: &mut ExplorerState) -> ExplorerAc
                                         egui::RichText::new(format_human_size(entry.size_bytes))
                                             .size(11.0)
                                             .color(Color32::from_rgb(148, 163, 184)),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            let title_resp = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&entry.name)
+                                                        .strong()
+                                                        .color(Color32::from_rgb(226, 232, 240)),
+                                                )
+                                                .truncate()
+                                                .sense(Sense::click()),
+                                            );
+                                            if title_resp.clicked() {
+                                                open_clicked = true;
+                                            }
+                                        },
                                     );
                                 },
                             );

@@ -417,7 +417,7 @@ pub fn show_waveform_panel(
     // Reserve room at bottom for the HUD strip
     let hud_reserve = 26.0;
     let canvas_w = ui.available_width().max(120.0);
-    let canvas_h = (ui.available_height() - hud_reserve).max(140.0);
+    let canvas_h = (ui.available_height() - hud_reserve).max(48.0);
     state.last_canvas_width = canvas_w;
 
     if state.fit_to_view {
