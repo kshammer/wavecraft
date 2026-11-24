@@ -14,7 +14,7 @@ use wavecraft_core::{AudioBuffer, EditableAudio, InspectedFile, RawPcmConfig, Sa
 
 use crate::ui::explorer::{ExplorerAction, ExplorerState, show_explorer};
 use crate::ui::inspector::{InspectorState, show_inspector};
-use crate::ui::tuner_fft::{TunerState, show_tuner_fft_panel};
+use crate::ui::tuner_fft::{TunerAction, TunerState, show_tuner_fft_panel, sync_from_hz};
 use crate::ui::waveform::{WaveformAction, WaveformViewState, show_waveform_panel};
 
 const ALL_ENCODINGS: [SampleEncoding; 5] = [
@@ -163,6 +163,12 @@ impl WavecraftApp {
                 self.selection = None;
                 self.active_channel = None;
                 self.inspector.selected_range = None;
+                self.waveform.reset_view_for_new_buffer();
+                let (wl, hz) =
+                    sync_from_hz(self.tuner.target_hz, self.editable.buffer().sample_rate);
+                self.tuner.wavelength_samples = wl;
+                self.tuner.target_hz = hz;
+                self.tuner.fft_dirty = true;
                 self.sync_engine_buffer();
                 self.status_message = format!("Loaded {}", path.display());
                 true
@@ -227,6 +233,7 @@ impl WavecraftApp {
             i.key_pressed(Key::Z) && (i.modifiers.ctrl || i.modifiers.mac_cmd) && !i.modifiers.shift
         });
         if undo_pressed && self.editable.undo() {
+            self.tuner.fft_dirty = true;
             self.sync_engine_buffer();
             self.status_message = "Undo".to_string();
         }
@@ -236,6 +243,7 @@ impl WavecraftApp {
             mod_cmd && (i.key_pressed(Key::Y) || (i.key_pressed(Key::Z) && i.modifiers.shift))
         });
         if redo_pressed && self.editable.redo() {
+            self.tuner.fft_dirty = true;
             self.sync_engine_buffer();
             self.status_message = "Redo".to_string();
         }
@@ -247,6 +255,87 @@ impl WavecraftApp {
         });
         if save_pressed {
             self.open_save_wav_modal();
+        }
+
+        let copy_pressed = ctx.input(|i| {
+            let mod_cmd = i.modifiers.ctrl || i.modifiers.mac_cmd;
+            mod_cmd && i.key_pressed(Key::C)
+        });
+        if copy_pressed
+            && let Some(sel) = self.selection.as_ref()
+            && sel.start < sel.end
+        {
+            let count = sel.len();
+            self.editable.copy(sel.clone());
+            self.status_message = format!("Copied {count} frames to clipboard");
+        }
+
+        let cut_pressed = ctx.input(|i| {
+            let mod_cmd = i.modifiers.ctrl || i.modifiers.mac_cmd;
+            mod_cmd && i.key_pressed(Key::X)
+        });
+        if cut_pressed
+            && let Some(sel) = self.selection.clone()
+            && sel.start < sel.end
+        {
+            let count = sel.len();
+            self.editable.cut(sel);
+            self.selection = None;
+            self.tuner.fft_dirty = true;
+            self.sync_engine_buffer();
+            self.status_message = format!("Cut {count} frames");
+        }
+
+        let paste_pressed = ctx.input(|i| {
+            let mod_cmd = i.modifiers.ctrl || i.modifiers.mac_cmd;
+            mod_cmd && i.key_pressed(Key::V)
+        });
+        if paste_pressed && let Some(clip_len) = self.editable.clipboard().map(|c| c.num_frames()) {
+            let num_frames = self.editable.buffer().num_frames();
+            let at = self.engine.state().playhead_frame().min(num_frames);
+            self.editable.paste(at);
+            let total_after = self.editable.buffer().num_frames();
+            self.selection = Some(at..(at + clip_len).min(total_after));
+            self.tuner.fft_dirty = true;
+            self.sync_engine_buffer();
+            self.status_message = format!("Pasted {clip_len} frames at frame {at}");
+        }
+
+        let delete_pressed = ctx.input(|i| {
+            !i.modifiers.ctrl
+                && !i.modifiers.mac_cmd
+                && (i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
+        });
+        if delete_pressed
+            && let Some(sel) = self.selection.clone()
+            && sel.start < sel.end
+        {
+            let count = sel.len();
+            self.editable.delete_range(sel);
+            self.selection = None;
+            self.tuner.fft_dirty = true;
+            self.sync_engine_buffer();
+            self.status_message = format!("Deleted {count} frames");
+        }
+
+        let zoom_in_pressed = ctx.input(|i| {
+            !i.modifiers.ctrl
+                && !i.modifiers.mac_cmd
+                && !i.modifiers.alt
+                && (i.key_pressed(Key::Equals) || i.key_pressed(Key::Plus))
+        });
+        if zoom_in_pressed {
+            self.waveform.zoom_in(self.editable.buffer().num_frames());
+        }
+
+        let zoom_out_pressed = ctx.input(|i| {
+            !i.modifiers.ctrl
+                && !i.modifiers.mac_cmd
+                && !i.modifiers.alt
+                && i.key_pressed(Key::Minus)
+        });
+        if zoom_out_pressed {
+            self.waveform.zoom_out(self.editable.buffer().num_frames());
         }
     }
 
@@ -287,6 +376,7 @@ impl WavecraftApp {
                         .clicked()
                         && self.editable.undo()
                     {
+                        self.tuner.fft_dirty = true;
                         self.sync_engine_buffer();
                         self.status_message = "Undo".to_string();
                     }
@@ -295,6 +385,7 @@ impl WavecraftApp {
                         .clicked()
                         && self.editable.redo()
                     {
+                        self.tuner.fft_dirty = true;
                         self.sync_engine_buffer();
                         self.status_message = "Redo".to_string();
                     }
@@ -452,6 +543,14 @@ impl WavecraftApp {
                                 self.selection = None;
                                 self.active_channel = None;
                                 self.inspector.selected_range = None;
+                                self.waveform.reset_view_for_new_buffer();
+                                let (wl, hz) = sync_from_hz(
+                                    self.tuner.target_hz,
+                                    self.editable.buffer().sample_rate,
+                                );
+                                self.tuner.wavelength_samples = wl;
+                                self.tuner.target_hz = hz;
+                                self.tuner.fft_dirty = true;
                                 self.sync_engine_buffer();
                                 self.status_message = format!(
                                     "Created new {} Hz {}ch buffer ({:.2}s)",
@@ -680,6 +779,14 @@ impl WavecraftApp {
                                         self.selection = None;
                                         self.active_channel = None;
                                         self.inspector.selected_range = None;
+                                        self.waveform.reset_view_for_new_buffer();
+                                        let (wl, hz) = sync_from_hz(
+                                            self.tuner.target_hz,
+                                            self.editable.buffer().sample_rate,
+                                        );
+                                        self.tuner.wavelength_samples = wl;
+                                        self.tuner.target_hz = hz;
+                                        self.tuner.fft_dirty = true;
                                         self.sync_engine_buffer();
                                         self.status_message =
                                             format!("Opened Raw PCM {}", target.display());
@@ -770,18 +877,35 @@ impl eframe::App for WavecraftApp {
 
         egui::TopBottomPanel::bottom("bottom_panel")
             .resizable(true)
-            .default_height(180.0)
-            .min_height(110.0)
+            .default_height(245.0)
+            .min_height(150.0)
             .show(ctx, |ui| {
-                let edited = show_tuner_fft_panel(
+                let playhead = self.engine.state().playhead_frame();
+                match show_tuner_fft_panel(
                     ui,
                     &mut self.editable,
-                    &self.selection,
+                    &mut self.selection,
                     self.active_channel,
+                    playhead,
                     &mut self.tuner,
-                );
-                if edited {
-                    self.sync_engine_buffer();
+                ) {
+                    TunerAction::None => {}
+                    TunerAction::BufferEdited => {
+                        self.tuner.fft_dirty = true;
+                        self.sync_engine_buffer();
+                    }
+                    TunerAction::ReplaceEntireBuffer(new_buf) => {
+                        self.editable.replace_buffer(new_buf);
+                        self.selection = None;
+                        self.active_channel = None;
+                        self.tuner.fft_dirty = true;
+                        self.waveform.reset_view_for_new_buffer();
+                        self.sync_engine_buffer();
+                        self.status_message = "Generated new 1s synthesized buffer".to_string();
+                    }
+                    TunerAction::StatusMessage(msg) => {
+                        self.status_message = msg;
+                    }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -813,13 +937,23 @@ impl eframe::App for WavecraftApp {
                 &mut self.selection,
                 &mut self.active_channel,
                 playhead,
+                self.tuner.wavelength_samples,
+                self.loop_enabled,
                 &mut self.waveform,
             ) {
                 WaveformAction::None => {}
                 WaveformAction::Seek(frame) => {
                     self.engine.seek(frame);
                 }
+                WaveformAction::SelectionChanged => {
+                    self.tuner.fft_dirty = true;
+                    self.sync_loop_range();
+                }
                 WaveformAction::BufferEdited => {
+                    self.tuner.fft_dirty = true;
+                }
+                WaveformAction::EditCommitted => {
+                    self.tuner.fft_dirty = true;
                     self.sync_engine_buffer();
                 }
             }
