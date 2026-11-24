@@ -101,6 +101,7 @@ pub enum HarmonicPreset {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TunerAction {
     None,
+    BufferEditedLive,
     BufferEdited,
     ReplaceEntireBuffer(AudioBuffer),
     StatusMessage(String),
@@ -136,6 +137,10 @@ pub struct TunerState {
     pub apply_mode: ApplyMode,
     pub gain_db: f32,
     pub normalize_target: f32,
+    pub live_apply_while_looping: bool,
+    live_base: Option<AudioBuffer>,
+    live_base_range: Option<Range<usize>>,
+    live_base_channel: Option<usize>,
 }
 
 impl Default for TunerState {
@@ -157,11 +162,22 @@ impl Default for TunerState {
             apply_mode: ApplyMode::Replace,
             gain_db: 0.0,
             normalize_target: 0.95,
+            live_apply_while_looping: true,
+            live_base: None,
+            live_base_range: None,
+            live_base_channel: None,
         }
     }
 }
 
 impl TunerState {
+    /// Clears the active live-edit base snapshot so the next live edit starts a fresh undo group.
+    pub fn reset_live_session(&mut self) {
+        self.live_base = None;
+        self.live_base_range = None;
+        self.live_base_channel = None;
+    }
+
     /// Builds [`SynthParams`] from the current tuner controls.
     pub fn synth_params(&self) -> SynthParams {
         let shape = match self.shape_kind {
@@ -374,9 +390,13 @@ pub fn show_tuner_fft_panel(
     selection: &mut Option<Range<usize>>,
     active_channel: Option<usize>,
     playhead_frame: usize,
+    is_looping_and_playing: bool,
     state: &mut TunerState,
 ) -> TunerAction {
     let mut action = TunerAction::None;
+    if !is_looping_and_playing || !state.live_apply_while_looping {
+        state.reset_live_session();
+    }
 
     // Header tab strip
     ui.horizontal(|ui| {
@@ -418,7 +438,14 @@ pub fn show_tuner_fft_panel(
                 );
             }
             BottomTab::TunerSynth => {
-                action = render_tuner_tab(ui, editable, selection, active_channel, state);
+                action = render_tuner_tab(
+                    ui,
+                    editable,
+                    selection,
+                    active_channel,
+                    is_looping_and_playing,
+                    state,
+                );
             }
             BottomTab::RegionDsp => {
                 action = render_region_dsp_tab(
@@ -667,14 +694,101 @@ fn render_spectrum_tab(
     }
 }
 
+fn resolve_tuner_range(
+    num_frames: usize,
+    selection: Option<&Range<usize>>,
+) -> Option<Range<usize>> {
+    if num_frames == 0 {
+        return None;
+    }
+    Some(
+        selection
+            .and_then(|s| {
+                let lo = s.start.min(num_frames);
+                let hi = s.end.min(num_frames);
+                (lo < hi).then_some(lo..hi)
+            })
+            .unwrap_or(0..num_frames),
+    )
+}
+
+pub(crate) fn apply_live_tuner_edit(
+    editable: &mut EditableAudio,
+    selection: &Option<Range<usize>>,
+    active_channel: Option<usize>,
+    state: &mut TunerState,
+) -> bool {
+    let Some(range) = resolve_tuner_range(editable.buffer().num_frames(), selection.as_ref())
+    else {
+        return false;
+    };
+
+    if state.live_base.is_none()
+        || state.live_base_range.as_ref() != Some(&range)
+        || state.live_base_channel != active_channel
+    {
+        state.live_base = Some(editable.buffer().clone());
+        state.live_base_range = Some(range.clone());
+        state.live_base_channel = active_channel;
+        editable.push_undo_snapshot();
+    }
+
+    let mut base = state
+        .live_base
+        .as_ref()
+        .expect("live_base initialized above")
+        .clone();
+    let channel_mask = channel_bitmask(active_channel);
+    let params = state.synth_params();
+    let mode = state.apply_mode;
+    apply_synth_to_buffer(&mut base, range, channel_mask, &params, mode);
+    editable.set_buffer_raw(base);
+    state.fft_dirty = true;
+    true
+}
+
+pub(crate) fn commit_tuner_apply(
+    editable: &mut EditableAudio,
+    selection: Option<&Range<usize>>,
+    active_channel: Option<usize>,
+    state: &mut TunerState,
+) -> bool {
+    let Some(range) = resolve_tuner_range(editable.buffer().num_frames(), selection) else {
+        return false;
+    };
+    let channel_mask = channel_bitmask(active_channel);
+    let params = state.synth_params();
+    let mode = state.apply_mode;
+
+    if state.live_base.is_some()
+        && state.live_base_range.as_ref() == Some(&range)
+        && state.live_base_channel == active_channel
+    {
+        let mut working = state.live_base.take().expect("live_base checked Some");
+        apply_synth_to_buffer(&mut working, range, channel_mask, &params, mode);
+        editable.set_buffer_raw(working);
+        state.reset_live_session();
+    } else {
+        state.reset_live_session();
+        editable.apply_transform(|b| {
+            apply_synth_to_buffer(b, range, channel_mask, &params, mode);
+        });
+    }
+
+    state.fft_dirty = true;
+    true
+}
+
 fn render_tuner_tab(
     ui: &mut egui::Ui,
     editable: &mut EditableAudio,
     selection: &mut Option<Range<usize>>,
     active_channel: Option<usize>,
+    is_looping_and_playing: bool,
     state: &mut TunerState,
 ) -> TunerAction {
     let mut action = TunerAction::None;
+    let mut params_changed = false;
     let sr = editable.buffer().sample_rate.max(2);
     let max_wl = sr as f64;
     let max_hz = (sr as f64 / 2.0).max(1.0);
@@ -695,6 +809,7 @@ fn render_tuner_tab(
             let (new_wl, new_hz) = sync_from_wavelength(wl, sr);
             state.wavelength_samples = new_wl;
             state.target_hz = new_hz;
+            params_changed = true;
         }
 
         ui.label("Freq (Hz):");
@@ -712,6 +827,7 @@ fn render_tuner_tab(
             let (new_wl, new_hz) = sync_from_hz(hz, sr);
             state.wavelength_samples = new_wl;
             state.target_hz = new_hz;
+            params_changed = true;
         }
 
         ui.separator();
@@ -733,12 +849,14 @@ fn render_tuner_tab(
                 let (new_wl, new_hz) = sync_from_hz(state.target_hz * mult, sr);
                 state.wavelength_samples = new_wl;
                 state.target_hz = new_hz;
+                params_changed = true;
             }
         }
         if ui.small_button("A4 (440 Hz)").clicked() {
             let (new_wl, new_hz) = sync_from_hz(440.0, sr);
             state.wavelength_samples = new_wl;
             state.target_hz = new_hz;
+            params_changed = true;
         }
     });
 
@@ -753,24 +871,44 @@ fn render_tuner_tab(
                 .clicked()
             {
                 state.shape_kind = kind;
+                params_changed = true;
             }
         }
 
         if state.shape_kind == SynthShapeKind::Pulse {
             ui.separator();
             ui.label("Duty");
-            ui.add(egui::Slider::new(&mut state.pulse_duty, 0.05..=0.95));
+            if ui
+                .add(egui::Slider::new(&mut state.pulse_duty, 0.05..=0.95))
+                .changed()
+            {
+                params_changed = true;
+            }
         }
 
         ui.separator();
         ui.label("Amp");
-        ui.add(egui::Slider::new(&mut state.amplitude, 0.0..=1.0));
+        if ui
+            .add(egui::Slider::new(&mut state.amplitude, 0.0..=1.0))
+            .changed()
+        {
+            params_changed = true;
+        }
         ui.label("Phase");
-        ui.add(egui::Slider::new(&mut state.phase_deg, 0.0..=360.0).suffix("°"));
+        if ui
+            .add(egui::Slider::new(&mut state.phase_deg, 0.0..=360.0).suffix("°"))
+            .changed()
+        {
+            params_changed = true;
+        }
 
         ui.separator();
+        let prev_mode = state.apply_mode;
         ui.selectable_value(&mut state.apply_mode, ApplyMode::Replace, "Replace");
         ui.selectable_value(&mut state.apply_mode, ApplyMode::Mix, "Mix");
+        if state.apply_mode != prev_mode {
+            params_changed = true;
+        }
     });
 
     ui.add_space(4.0);
@@ -794,6 +932,7 @@ fn render_tuner_tab(
                     if ui.small_button(lbl).clicked() {
                         state.harmonic_amps = harmonic_preset_amps(preset);
                         state.shape_kind = SynthShapeKind::Harmonics;
+                        params_changed = true;
                     }
                 }
             });
@@ -823,8 +962,13 @@ fn render_tuner_tab(
             {
                 let idx = (((pos.x - inner.left()) / col_w).floor() as isize).clamp(0, 15) as usize;
                 let amp = ((inner.bottom() - pos.y) / inner.height()).clamp(0.0, 1.0);
-                state.harmonic_amps[idx] = amp;
-                state.shape_kind = SynthShapeKind::Harmonics;
+                if (state.harmonic_amps[idx] - amp).abs() > 1e-6
+                    || state.shape_kind != SynthShapeKind::Harmonics
+                {
+                    state.harmonic_amps[idx] = amp;
+                    state.shape_kind = SynthShapeKind::Harmonics;
+                    params_changed = true;
+                }
             }
 
             for (i, &amp) in state.harmonic_amps.iter().enumerate() {
@@ -909,19 +1053,21 @@ fn render_tuner_tab(
         if ui
             .add_enabled(num_frames > 0, egui::Button::new("Apply to Selection"))
             .clicked()
+            && commit_tuner_apply(editable, selection.as_ref(), active_channel, state)
         {
-            let range = selection.clone().unwrap_or(0..num_frames);
-            let channel_mask = channel_bitmask(active_channel);
-            let params = state.synth_params();
-            let mode = state.apply_mode;
-            editable.apply_transform(|b| {
-                apply_synth_to_buffer(b, range, channel_mask, &params, mode);
-            });
-            state.fft_dirty = true;
             action = TunerAction::BufferEdited;
         }
 
+        ui.checkbox(
+            &mut state.live_apply_while_looping,
+            "Live apply while looping",
+        )
+        .on_hover_text(
+            "Immediately apply wavelength & harmonic changes to the selection while Loop playback is active (grouped as one Undo step)",
+        );
+
         if ui.button("Generate New 1s Buffer").clicked() {
+            state.reset_live_session();
             let cur_buf = editable.buffer();
             let gen_sr = cur_buf.sample_rate.max(1);
             let ch_count = cur_buf.num_channels().max(1);
@@ -942,6 +1088,7 @@ fn render_tuner_tab(
             .clicked()
             && let Some(sel) = selection.clone()
         {
+            state.reset_live_session();
             let start = sel.start.min(num_frames);
             let end = sel.end.min(num_frames);
             if start < end {
@@ -973,6 +1120,15 @@ fn render_tuner_tab(
             }
         }
     });
+
+    if !is_looping_and_playing || !state.live_apply_while_looping {
+        state.reset_live_session();
+    } else if params_changed
+        && matches!(action, TunerAction::None)
+        && apply_live_tuner_edit(editable, selection, active_channel, state)
+    {
+        action = TunerAction::BufferEditedLive;
+    }
 
     action
 }
@@ -1194,5 +1350,140 @@ mod tests {
         assert_eq!(channel_bitmask(Some(64)), Some(0));
         assert_eq!(channel_bitmask(Some(100)), Some(0));
         assert_eq!(channel_bitmask(None), None);
+    }
+
+    #[test]
+    fn live_tuner_edit_snapshots_once_and_undoes_cleanly() {
+        use wavecraft_core::SampleEncoding;
+
+        let original_buf = AudioBuffer::from_channels(
+            44_100,
+            vec![vec![0.25; 200], vec![-0.25; 200]],
+            SampleEncoding::Float32,
+        )
+        .unwrap();
+        let mut editable = EditableAudio::new(original_buf.clone());
+        let mut state = TunerState::default();
+        let selection = Some(20..120);
+
+        // First live edit pushes one undo snapshot and saves live_base.
+        let (wl1, hz1) = sync_from_hz(220.0, 44_100);
+        state.wavelength_samples = wl1;
+        state.target_hz = hz1;
+        assert!(apply_live_tuner_edit(
+            &mut editable,
+            &selection,
+            None,
+            &mut state
+        ));
+        assert_eq!(editable.undo_len(), 1);
+        assert!(editable.is_dirty());
+
+        // Second & third consecutive live edits reuse live_base and push NO extra undo snapshots.
+        state.shape_kind = SynthShapeKind::Harmonics;
+        state.harmonic_amps = harmonic_preset_amps(HarmonicPreset::Saw);
+        state.amplitude = 0.6;
+        assert!(apply_live_tuner_edit(
+            &mut editable,
+            &selection,
+            None,
+            &mut state
+        ));
+
+        let (wl2, hz2) = sync_from_hz(550.0, 44_100);
+        state.wavelength_samples = wl2;
+        state.target_hz = hz2;
+        state.apply_mode = ApplyMode::Mix;
+        assert!(apply_live_tuner_edit(
+            &mut editable,
+            &selection,
+            None,
+            &mut state
+        ));
+
+        assert_eq!(
+            editable.undo_len(),
+            1,
+            "consecutive live tuner edits must share one undo snapshot"
+        );
+        assert!(state.fft_dirty);
+
+        // Verify the final edit was applied against original live_base (not stacked repeatedly).
+        let mut expected_buf = original_buf.clone();
+        apply_synth_to_buffer(
+            &mut expected_buf,
+            20..120,
+            None,
+            &state.synth_params(),
+            ApplyMode::Mix,
+        );
+        assert_eq!(editable.buffer(), &expected_buf);
+        // Outside selection must be untouched.
+        assert_eq!(editable.buffer().get_sample(0, 10), Some(0.25));
+        assert_eq!(editable.buffer().get_sample(1, 150), Some(-0.25));
+
+        // A single undo restores the exact original audio buffer.
+        assert!(editable.undo());
+        assert_eq!(editable.buffer(), &original_buf);
+        assert!(!editable.can_undo());
+    }
+
+    #[test]
+    fn explicit_apply_after_live_mix_does_not_double_mix_or_duplicate_undo() {
+        use wavecraft_core::SampleEncoding;
+
+        let original_buf = AudioBuffer::from_channels(
+            44_100,
+            vec![vec![0.25; 200], vec![-0.25; 200]],
+            SampleEncoding::Float32,
+        )
+        .unwrap();
+        let mut editable = EditableAudio::new(original_buf.clone());
+        let mut state = TunerState::default();
+        let selection = Some(20..120);
+
+        let (wl, hz) = sync_from_hz(330.0, 44_100);
+        state.wavelength_samples = wl;
+        state.target_hz = hz;
+        state.amplitude = 0.4;
+        state.apply_mode = ApplyMode::Mix;
+
+        assert!(apply_live_tuner_edit(
+            &mut editable,
+            &selection,
+            Some(0),
+            &mut state
+        ));
+        assert_eq!(editable.undo_len(), 1);
+        assert!(state.live_base.is_some());
+
+        // Clicking "Apply to Selection" while live session is active must reuse live_base
+        // rather than double-mixing onto the already-mixed buffer or pushing a second undo step.
+        assert!(commit_tuner_apply(
+            &mut editable,
+            selection.as_ref(),
+            Some(0),
+            &mut state
+        ));
+        assert!(state.live_base.is_none());
+        assert!(state.live_base_range.is_none());
+        assert!(state.live_base_channel.is_none());
+        assert!(state.fft_dirty);
+        assert_eq!(editable.undo_len(), 1);
+
+        let mut expected_buf = original_buf.clone();
+        apply_synth_to_buffer(
+            &mut expected_buf,
+            20..120,
+            channel_bitmask(Some(0)),
+            &state.synth_params(),
+            ApplyMode::Mix,
+        );
+        assert_eq!(editable.buffer(), &expected_buf);
+
+        // One undo restores the original buffer cleanly.
+        assert!(editable.undo());
+        assert_eq!(editable.buffer(), &original_buf);
+        assert!(!editable.can_undo());
     }
 }

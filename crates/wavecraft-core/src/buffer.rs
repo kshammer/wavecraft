@@ -352,6 +352,13 @@ impl EditableAudio {
         self.dirty = true;
     }
 
+    /// Replaces the buffer in-place and marks it dirty without pushing an undo snapshot.
+    /// Callers performing continuous live previews should call [`Self::push_undo_snapshot`] once at session start.
+    pub fn set_buffer_raw(&mut self, new_buf: AudioBuffer) {
+        self.buffer = new_buf;
+        self.dirty = true;
+    }
+
     /// Directly sets a single sample without pushing an undo snapshot (for interactive strokes).
     pub fn set_sample_raw(&mut self, ch: usize, frame: usize, val: f32) {
         if self.buffer.set_sample(ch, frame, val) {
@@ -733,5 +740,26 @@ mod tests {
         assert_eq!(editable.buffer().num_frames(), 2);
         assert_eq!(editable.buffer().channels[0], vec![0.4, 0.5]);
         assert_eq!(editable.buffer().channels[1], vec![-0.4, -0.5]);
+    }
+
+    #[test]
+    fn set_buffer_raw_updates_samples_and_dirty_without_pushing_undo() {
+        let initial =
+            AudioBuffer::from_channels(44100, vec![vec![0.1, 0.2, 0.3]], SampleEncoding::Float32)
+                .unwrap();
+        let replacement =
+            AudioBuffer::from_channels(44100, vec![vec![-0.4, 0.5, -0.6]], SampleEncoding::Float32)
+                .unwrap();
+
+        let mut editable = EditableAudio::new(initial);
+        assert!(!editable.is_dirty());
+        assert_eq!(editable.undo_len(), 0);
+
+        editable.set_buffer_raw(replacement.clone());
+
+        assert_eq!(editable.buffer(), &replacement);
+        assert!(editable.is_dirty());
+        assert_eq!(editable.undo_len(), 0);
+        assert!(!editable.can_undo());
     }
 }

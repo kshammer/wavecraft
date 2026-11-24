@@ -42,13 +42,19 @@ impl PlaybackState {
 }
 
 enum PlaybackCommand {
-    SetBuffer(Arc<AudioBuffer>),
+    SetBuffer {
+        buffer: Arc<AudioBuffer>,
+        flush: bool,
+    },
     Play,
     Pause,
     Stop,
     TogglePlayPause,
     Seek(usize),
-    SetLoopRange(Option<Range<usize>>),
+    SetLoopRange {
+        range: Option<Range<usize>>,
+        flush: bool,
+    },
     SetVolume(f32),
     Shutdown,
 }
@@ -102,13 +108,25 @@ impl PlaybackEngine {
         }
     }
 
-    /// Replaces the active audio buffer, clamping the playhead and reopening the stream if the
-    /// sample rate or channel count changed.
-    pub fn set_buffer(&self, buffer: Arc<AudioBuffer>) {
+    fn send_buffer(&self, buffer: Arc<AudioBuffer>, flush: bool) {
         self.state
             .total_frames
             .store(buffer.num_frames(), Ordering::Release);
-        let _ = self.cmd_tx.send(PlaybackCommand::SetBuffer(buffer));
+        let _ = self
+            .cmd_tx
+            .send(PlaybackCommand::SetBuffer { buffer, flush });
+    }
+
+    /// Replaces the active audio buffer, clamping the playhead and reopening the stream if the
+    /// sample rate or channel count changed.
+    pub fn set_buffer(&self, buffer: Arc<AudioBuffer>) {
+        self.send_buffer(buffer, false);
+    }
+
+    /// Replaces the active audio buffer and immediately flushes the open output stream so edits
+    /// are heard without OS pipe-buffer lag.
+    pub fn set_buffer_immediate(&self, buffer: Arc<AudioBuffer>) {
+        self.send_buffer(buffer, true);
     }
 
     /// Starts or resumes playback from the current playhead.
@@ -138,7 +156,18 @@ impl PlaybackEngine {
 
     /// Sets or clears an optional loop range (`start..end` with `start < end <= num_frames`).
     pub fn set_loop_range(&self, range: Option<Range<usize>>) {
-        let _ = self.cmd_tx.send(PlaybackCommand::SetLoopRange(range));
+        let _ = self.cmd_tx.send(PlaybackCommand::SetLoopRange {
+            range,
+            flush: false,
+        });
+    }
+
+    /// Sets or clears an optional loop range and immediately flushes any open output stream so
+    /// the new loop region is audible without pipe-buffer lag.
+    pub fn set_loop_range_immediate(&self, range: Option<Range<usize>>) {
+        let _ = self
+            .cmd_tx
+            .send(PlaybackCommand::SetLoopRange { range, flush: true });
     }
 
     /// Sets the playback output gain, clamped to `0.0..=2.0`.
@@ -272,7 +301,7 @@ impl<B: AudioBackend> PlaybackWorker<B> {
                     | PlaybackCommand::TogglePlayPause
                     | PlaybackCommand::Seek(_)
                     | PlaybackCommand::Play
-                    | PlaybackCommand::SetBuffer(_)
+                    | PlaybackCommand::SetBuffer { .. }
             )
         {
             self.draining = false;
@@ -283,7 +312,7 @@ impl<B: AudioBackend> PlaybackWorker<B> {
         }
 
         match cmd {
-            PlaybackCommand::SetBuffer(buf) => self.on_set_buffer(buf),
+            PlaybackCommand::SetBuffer { buffer, flush } => self.on_set_buffer(buffer, flush),
             PlaybackCommand::Play => self.on_play(),
             PlaybackCommand::Pause => self.on_pause(),
             PlaybackCommand::Stop => self.on_stop(),
@@ -295,9 +324,7 @@ impl<B: AudioBackend> PlaybackWorker<B> {
                 }
             }
             PlaybackCommand::Seek(frame) => self.on_seek(frame),
-            PlaybackCommand::SetLoopRange(range) => {
-                self.loop_range = range;
-            }
+            PlaybackCommand::SetLoopRange { range, flush } => self.on_set_loop_range(range, flush),
             PlaybackCommand::SetVolume(vol) => {
                 self.volume = if vol.is_nan() {
                     0.0
@@ -373,7 +400,17 @@ impl<B: AudioBackend> PlaybackWorker<B> {
         }
     }
 
-    fn on_set_buffer(&mut self, new_buf: Arc<AudioBuffer>) {
+    fn reopen_stream_if_playing(&mut self) {
+        self.close_stream();
+        if self.playing
+            && let Some(buf) = self.buffer.clone()
+            && !self.ensure_stream_open(&buf)
+        {
+            self.set_playing(false);
+        }
+    }
+
+    fn on_set_buffer(&mut self, new_buf: Arc<AudioBuffer>, flush: bool) {
         let new_frames = new_buf.num_frames();
         let clamped_playhead = self.playhead.min(new_frames);
         self.set_playhead(clamped_playhead);
@@ -388,13 +425,44 @@ impl<B: AudioBackend> PlaybackWorker<B> {
             return;
         }
 
-        if self.stream_open && config_changed {
-            self.close_stream();
-            if self.playing
-                && let Some(buf) = self.buffer.clone()
-                && !self.ensure_stream_open(&buf)
-            {
+        let valid_loop = self.valid_loop_range(new_frames);
+        if self.playing
+            && let Some(loop_r) = &valid_loop
+            && (self.playhead < loop_r.start || self.playhead >= loop_r.end)
+        {
+            self.set_playhead(loop_r.start);
+        }
+
+        if self.stream_open && (config_changed || flush) {
+            if valid_loop.is_none() && clamped_playhead >= new_frames {
+                self.draining = false;
                 self.set_playing(false);
+                self.close_stream();
+                self.set_playhead(0);
+            } else {
+                self.reopen_stream_if_playing();
+            }
+        }
+    }
+
+    fn on_set_loop_range(&mut self, range: Option<Range<usize>>, flush: bool) {
+        self.loop_range = range;
+        let num_frames = self.buffer.as_ref().map_or(0, |b| b.num_frames());
+        let valid_loop = self.valid_loop_range(num_frames);
+
+        if self.draining && valid_loop.is_some() {
+            self.draining = false;
+            self.close_stream();
+        }
+
+        if self.playing {
+            if let Some(loop_r) = valid_loop
+                && (self.playhead < loop_r.start || self.playhead >= loop_r.end)
+            {
+                self.set_playhead(loop_r.start);
+            }
+            if flush && self.stream_open {
+                self.reopen_stream_if_playing();
             }
         }
     }
@@ -455,26 +523,25 @@ impl<B: AudioBackend> PlaybackWorker<B> {
             return;
         }
 
-        if !self.ensure_stream_open(&buf) {
-            self.set_playing(false);
-            return;
-        }
-
         let valid_loop = self.valid_loop_range(num_frames);
-        let start = self.playhead;
-
-        let (limit, wrap_target) = if let Some(loop_r) = valid_loop
-            && start < loop_r.end
-        {
-            (loop_r.end, Some(loop_r.start))
+        let (start, limit, wrap_target) = if let Some(loop_r) = valid_loop {
+            if self.playhead < loop_r.start || self.playhead >= loop_r.end {
+                self.set_playhead(loop_r.start);
+            }
+            (self.playhead, loop_r.end, Some(loop_r.start))
         } else {
-            (num_frames, None)
+            (self.playhead, num_frames, None)
         };
 
         if start >= limit {
             self.set_playing(false);
             self.close_stream();
             self.set_playhead(0);
+            return;
+        }
+
+        if !self.ensure_stream_open(&buf) {
+            self.set_playing(false);
             return;
         }
 
@@ -792,5 +859,199 @@ mod tests {
                 "pause did not immediately abort draining"
             );
         }
+    }
+
+    #[test]
+    fn set_loop_range_while_playing_jumps_immediately_both_forward_and_backward() {
+        let backend = NullAudioBackend::new().with_paced(true);
+        let log = backend.log();
+        let engine = PlaybackEngine::with_backend(backend);
+
+        let buf = make_stereo_buffer(44100, 1000);
+        let expected_forward = buf.to_interleaved_f32(400..500, 1.0);
+        let expected_backward = buf.to_interleaved_f32(50..150, 1.0);
+
+        engine.set_buffer(Arc::clone(&buf));
+        engine.set_loop_range(Some(0..100));
+        engine.play();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                !log.lock().unwrap().chunks.is_empty()
+            }),
+            "playback did not emit initial loop chunk"
+        );
+
+        // Jump forward to 400..500 while playhead is near 0..100.
+        engine.set_loop_range(Some(400..500));
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                log.lock().unwrap().chunks.contains(&expected_forward)
+            }),
+            "playhead did not jump forward into 400..500"
+        );
+
+        let idx_before_backward = log.lock().unwrap().chunks.len();
+
+        // Jump backward to 50..150 while playhead is inside 400..500.
+        engine.set_loop_range(Some(50..150));
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let guard = log.lock().unwrap();
+                guard.chunks[idx_before_backward..].contains(&expected_backward)
+            }),
+            "playhead did not jump backward into 50..150"
+        );
+
+        engine.pause();
+        let _ = wait_until(Duration::from_secs(1), || !engine.state().is_playing());
+
+        let guard = log.lock().unwrap();
+        assert_eq!(
+            guard.drain_count, 0,
+            "looping playback must never play to EOF"
+        );
+        // No chunk should ever emit the tail 500..1000.
+        let tail_first_sample = buf.to_interleaved_f32(500..501, 1.0)[0];
+        assert!(
+            !guard.chunks.iter().any(|c| c
+                .first()
+                .is_some_and(|&s| (s - tail_first_sample).abs() < 1e-6)),
+            "playback leaked into frames past loop end"
+        );
+    }
+
+    #[test]
+    fn set_loop_range_immediate_and_set_buffer_immediate_flush_stream() {
+        let backend = NullAudioBackend::new().with_paced(true);
+        let log = backend.log();
+        let engine = PlaybackEngine::with_backend(backend);
+
+        let buf_a = make_stereo_buffer(44100, 1000);
+        let expected_a_loop = buf_a.to_interleaved_f32(200..300, 1.0);
+
+        engine.set_buffer(Arc::clone(&buf_a));
+        engine.set_loop_range(Some(0..100));
+        engine.play();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let guard = log.lock().unwrap();
+                guard.open_count >= 1 && !guard.chunks.is_empty()
+            }),
+            "initial stream did not open and emit samples"
+        );
+
+        engine.set_loop_range_immediate(Some(200..300));
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let guard = log.lock().unwrap();
+                guard.stop_count >= 1
+                    && guard.open_count >= 2
+                    && guard.chunks.contains(&expected_a_loop)
+            }),
+            "set_loop_range_immediate did not flush stream and emit 200..300"
+        );
+
+        let (prev_stop, prev_open, prev_chunks) = {
+            let guard = log.lock().unwrap();
+            (guard.stop_count, guard.open_count, guard.chunks.len())
+        };
+
+        // Same sample rate & channel count as buf_a, different sample contents.
+        let buf_b = Arc::new(
+            AudioBuffer::from_channels(
+                44100,
+                vec![vec![0.75; 1000], vec![-0.75; 1000]],
+                SampleEncoding::Float32,
+            )
+            .unwrap(),
+        );
+        let expected_b_loop = buf_b.to_interleaved_f32(200..300, 1.0);
+
+        engine.set_buffer_immediate(Arc::clone(&buf_b));
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let guard = log.lock().unwrap();
+                guard.stop_count > prev_stop
+                    && guard.open_count > prev_open
+                    && guard.chunks[prev_chunks..].contains(&expected_b_loop)
+            }),
+            "set_buffer_immediate did not flush stream and emit updated buffer samples"
+        );
+
+        assert!(engine.state().is_playing());
+        assert_eq!(log.lock().unwrap().drain_count, 0);
+    }
+
+    #[test]
+    fn set_loop_range_while_draining_cancels_drain_and_resumes_looping() {
+        let backend = NullAudioBackend::new().with_drain_polls_before_done(1000);
+        let log = backend.log();
+        let engine = PlaybackEngine::with_backend(backend);
+
+        let buf = make_stereo_buffer(44100, 200);
+        let expected_loop_chunk = buf.to_interleaved_f32(50..100, 1.0);
+        engine.set_buffer(buf);
+        engine.play();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                log.lock().unwrap().drain_count == 1
+            }),
+            "engine did not enter draining state"
+        );
+        assert!(engine.state().is_playing());
+
+        let prev_open_count = log.lock().unwrap().open_count;
+        engine.set_loop_range(Some(50..100));
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let guard = log.lock().unwrap();
+                guard.stop_count >= 1
+                    && guard.open_count > prev_open_count
+                    && guard.chunks.contains(&expected_loop_chunk)
+            }),
+            "set_loop_range did not cancel drain and resume looping"
+        );
+        assert!(engine.state().is_playing());
+        assert_eq!(log.lock().unwrap().drain_count, 1);
+    }
+
+    #[test]
+    fn set_buffer_immediate_shrunk_past_playhead_stops_without_reopening() {
+        let backend = NullAudioBackend::new().with_paced(true);
+        let log = backend.log();
+        let engine = PlaybackEngine::with_backend(backend);
+
+        engine.set_buffer(make_stereo_buffer(44100, 10_000));
+        engine.play();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                log.lock().unwrap().open_count >= 1
+                    && engine.state().playhead_frame() >= CHUNK_FRAMES
+            }),
+            "playback did not advance past 1 chunk"
+        );
+        let open_before = log.lock().unwrap().open_count;
+
+        // Shrink buffer below current playhead while non-looping.
+        engine.set_buffer_immediate(make_stereo_buffer(44100, 100));
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let guard = log.lock().unwrap();
+                guard.stop_count >= 1 && !engine.state().is_playing()
+            }),
+            "shrunk buffer past playhead did not stop cleanly"
+        );
+        assert_eq!(
+            log.lock().unwrap().open_count,
+            open_before,
+            "engine must not reopen stream right before EOF"
+        );
+        assert_eq!(engine.state().playhead_frame(), 0);
     }
 }

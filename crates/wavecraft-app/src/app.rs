@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, Key, Stroke};
 use wavecraft_audio::PlaybackEngine;
@@ -16,6 +16,8 @@ use crate::ui::explorer::{ExplorerAction, ExplorerState, show_explorer};
 use crate::ui::inspector::{InspectorState, show_inspector};
 use crate::ui::tuner_fft::{TunerAction, TunerState, show_tuner_fft_panel, sync_from_hz};
 use crate::ui::waveform::{WaveformAction, WaveformViewState, show_waveform_panel};
+
+const LIVE_AUDIO_SYNC_INTERVAL: Duration = Duration::from_millis(60);
 
 const ALL_ENCODINGS: [SampleEncoding; 5] = [
     SampleEncoding::PcmU8,
@@ -74,6 +76,8 @@ pub struct WavecraftApp {
     pub waveform: WaveformViewState,
     pub tuner: TunerState,
     modal: Option<ActiveModal>,
+    last_live_audio_sync: Option<Instant>,
+    pending_live_audio_flush: bool,
     pub status_message: String,
 }
 
@@ -96,7 +100,6 @@ impl WavecraftApp {
 
         let default_buf = make_sine_440_buffer(44_100, 1, 1.0);
         let engine = PlaybackEngine::new_system();
-        engine.set_buffer(Arc::new(default_buf.clone()));
 
         let mut app = Self {
             current_path: None,
@@ -114,9 +117,12 @@ impl WavecraftApp {
             waveform: WaveformViewState::default(),
             tuner: TunerState::default(),
             modal: None,
+            last_live_audio_sync: None,
+            pending_live_audio_flush: false,
             status_message: "Ready — 440 Hz 1.0s Sine Buffer".to_string(),
         };
         app.engine.set_volume(app.volume);
+        app.sync_engine_buffer();
 
         if let Some(path) = initial_file {
             app.open_file(&path, None);
@@ -134,7 +140,37 @@ impl WavecraftApp {
     pub fn sync_engine_buffer(&self) {
         self.engine
             .set_buffer(Arc::new(self.editable.buffer().clone()));
-        self.sync_loop_range();
+        self.sync_loop_range(false);
+    }
+
+    fn sync_engine_buffer_immediate(&mut self) {
+        let buf = Arc::new(self.editable.buffer().clone());
+        if self.engine.state().is_playing() {
+            self.engine.set_buffer_immediate(buf);
+        } else {
+            self.engine.set_buffer(buf);
+        }
+        self.sync_loop_range(false);
+        self.last_live_audio_sync = None;
+        self.pending_live_audio_flush = false;
+    }
+
+    fn sync_engine_buffer_live_throttled(&mut self) {
+        let buf = Arc::new(self.editable.buffer().clone());
+        let is_playing = self.engine.state().is_playing();
+        let now = Instant::now();
+        let should_flush = is_playing
+            && self
+                .last_live_audio_sync
+                .is_none_or(|prev| now.duration_since(prev) >= LIVE_AUDIO_SYNC_INTERVAL);
+        if should_flush {
+            self.engine.set_buffer_immediate(buf);
+            self.last_live_audio_sync = Some(now);
+            self.pending_live_audio_flush = false;
+        } else {
+            self.engine.set_buffer(buf);
+            self.pending_live_audio_flush = is_playing;
+        }
     }
 
     fn clamp_selection_to_buffer(&mut self) {
@@ -147,9 +183,13 @@ impl WavecraftApp {
         }
     }
 
-    fn sync_loop_range(&self) {
+    fn sync_loop_range(&self, immediate: bool) {
         if !self.loop_enabled {
-            self.engine.set_loop_range(None);
+            if immediate {
+                self.engine.set_loop_range_immediate(None);
+            } else {
+                self.engine.set_loop_range(None);
+            }
             return;
         }
         let total = self.editable.buffer().num_frames();
@@ -158,7 +198,11 @@ impl WavecraftApp {
             _ if total > 0 => Some(0..total),
             _ => None,
         };
-        self.engine.set_loop_range(range);
+        if immediate {
+            self.engine.set_loop_range_immediate(range);
+        } else {
+            self.engine.set_loop_range(range);
+        }
     }
 
     fn open_file(&mut self, path: &Path, raw_cfg: Option<RawPcmConfig>) -> bool {
@@ -178,8 +222,9 @@ impl WavecraftApp {
                     sync_from_hz(self.tuner.target_hz, self.editable.buffer().sample_rate);
                 self.tuner.wavelength_samples = wl;
                 self.tuner.target_hz = hz;
+                self.tuner.reset_live_session();
                 self.tuner.fft_dirty = true;
-                self.sync_engine_buffer();
+                self.sync_engine_buffer_immediate();
                 self.status_message = format!("Loaded {}", path.display());
                 true
             }
@@ -236,6 +281,9 @@ impl WavecraftApp {
 
         let space_pressed = ctx.input(|i| i.key_pressed(Key::Space));
         if space_pressed {
+            if self.engine.state().is_playing() {
+                self.tuner.reset_live_session();
+            }
             self.engine.toggle_play_pause();
         }
 
@@ -244,8 +292,9 @@ impl WavecraftApp {
         });
         if undo_pressed && self.editable.undo() {
             self.clamp_selection_to_buffer();
+            self.tuner.reset_live_session();
             self.tuner.fft_dirty = true;
-            self.sync_engine_buffer();
+            self.sync_engine_buffer_immediate();
             self.status_message = "Undo".to_string();
         }
 
@@ -255,8 +304,9 @@ impl WavecraftApp {
         });
         if redo_pressed && self.editable.redo() {
             self.clamp_selection_to_buffer();
+            self.tuner.reset_live_session();
             self.tuner.fft_dirty = true;
-            self.sync_engine_buffer();
+            self.sync_engine_buffer_immediate();
             self.status_message = "Redo".to_string();
         }
 
@@ -292,8 +342,9 @@ impl WavecraftApp {
             let count = sel.len();
             self.editable.cut(sel);
             self.selection = None;
+            self.tuner.reset_live_session();
             self.tuner.fft_dirty = true;
-            self.sync_engine_buffer();
+            self.sync_engine_buffer_immediate();
             self.status_message = format!("Cut {count} frames");
         }
 
@@ -307,8 +358,9 @@ impl WavecraftApp {
             self.editable.paste(at);
             let total_after = self.editable.buffer().num_frames();
             self.selection = Some(at..(at + clip_len).min(total_after));
+            self.tuner.reset_live_session();
             self.tuner.fft_dirty = true;
-            self.sync_engine_buffer();
+            self.sync_engine_buffer_immediate();
             self.status_message = format!("Pasted {clip_len} frames at frame {at}");
         }
 
@@ -324,8 +376,9 @@ impl WavecraftApp {
             let count = sel.len();
             self.editable.delete_range(sel);
             self.selection = None;
+            self.tuner.reset_live_session();
             self.tuner.fft_dirty = true;
-            self.sync_engine_buffer();
+            self.sync_engine_buffer_immediate();
             self.status_message = format!("Deleted {count} frames");
         }
 
@@ -388,8 +441,9 @@ impl WavecraftApp {
                         && self.editable.undo()
                     {
                         self.clamp_selection_to_buffer();
+                        self.tuner.reset_live_session();
                         self.tuner.fft_dirty = true;
-                        self.sync_engine_buffer();
+                        self.sync_engine_buffer_immediate();
                         self.status_message = "Undo".to_string();
                     }
                     if ui
@@ -398,8 +452,9 @@ impl WavecraftApp {
                         && self.editable.redo()
                     {
                         self.clamp_selection_to_buffer();
+                        self.tuner.reset_live_session();
                         self.tuner.fft_dirty = true;
-                        self.sync_engine_buffer();
+                        self.sync_engine_buffer_immediate();
                         self.status_message = "Redo".to_string();
                     }
 
@@ -410,14 +465,21 @@ impl WavecraftApp {
                     let is_playing = playback_state.is_playing();
                     let play_label = if is_playing { "Pause" } else { "Play" };
                     if ui.button(play_label).clicked() {
+                        if is_playing {
+                            self.tuner.reset_live_session();
+                        }
                         self.engine.toggle_play_pause();
                     }
                     if ui.button("Stop").clicked() {
+                        self.tuner.reset_live_session();
                         self.engine.stop();
                     }
                     if ui.selectable_label(self.loop_enabled, "Loop").clicked() {
                         self.loop_enabled = !self.loop_enabled;
-                        self.sync_loop_range();
+                        if !self.loop_enabled {
+                            self.tuner.reset_live_session();
+                        }
+                        self.sync_loop_range(self.loop_enabled);
                     }
 
                     ui.label("Vol");
@@ -563,8 +625,9 @@ impl WavecraftApp {
                                 );
                                 self.tuner.wavelength_samples = wl;
                                 self.tuner.target_hz = hz;
+                                self.tuner.reset_live_session();
                                 self.tuner.fft_dirty = true;
-                                self.sync_engine_buffer();
+                                self.sync_engine_buffer_immediate();
                                 self.status_message = format!(
                                     "Created new {} Hz {}ch buffer ({:.2}s)",
                                     *sample_rate, *channels, *duration_secs
@@ -801,8 +864,9 @@ impl WavecraftApp {
                                         );
                                         self.tuner.wavelength_samples = wl;
                                         self.tuner.target_hz = hz;
+                                        self.tuner.reset_live_session();
                                         self.tuner.fft_dirty = true;
-                                        self.sync_engine_buffer();
+                                        self.sync_engine_buffer_immediate();
                                         self.status_message =
                                             format!("Opened Raw PCM {}", target.display());
                                         keep_open = false;
@@ -829,6 +893,23 @@ impl WavecraftApp {
 impl eframe::App for WavecraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
+
+        if self.pending_live_audio_flush {
+            if !self.engine.state().is_playing() {
+                self.pending_live_audio_flush = false;
+            } else if self
+                .last_live_audio_sync
+                .is_none_or(|prev| prev.elapsed() >= LIVE_AUDIO_SYNC_INTERVAL)
+            {
+                self.engine
+                    .set_buffer_immediate(Arc::new(self.editable.buffer().clone()));
+                self.last_live_audio_sync = Some(Instant::now());
+                self.pending_live_audio_flush = false;
+            } else if let Some(prev) = self.last_live_audio_sync {
+                let remaining = LIVE_AUDIO_SYNC_INTERVAL.saturating_sub(prev.elapsed());
+                ctx.request_repaint_after(remaining);
+            }
+        }
 
         if self.engine.state().is_playing() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -896,27 +977,35 @@ impl eframe::App for WavecraftApp {
             .min_height(150.0)
             .show(ctx, |ui| {
                 let playhead = self.engine.state().playhead_frame();
+                let is_looping_and_playing = self.loop_enabled && self.engine.state().is_playing();
                 match show_tuner_fft_panel(
                     ui,
                     &mut self.editable,
                     &mut self.selection,
                     self.active_channel,
                     playhead,
+                    is_looping_and_playing,
                     &mut self.tuner,
                 ) {
                     TunerAction::None => {}
+                    TunerAction::BufferEditedLive => {
+                        self.tuner.fft_dirty = true;
+                        self.sync_engine_buffer_live_throttled();
+                    }
                     TunerAction::BufferEdited => {
                         self.clamp_selection_to_buffer();
+                        self.tuner.reset_live_session();
                         self.tuner.fft_dirty = true;
-                        self.sync_engine_buffer();
+                        self.sync_engine_buffer_immediate();
                     }
                     TunerAction::ReplaceEntireBuffer(new_buf) => {
                         self.editable.replace_buffer(new_buf);
                         self.selection = None;
                         self.active_channel = None;
+                        self.tuner.reset_live_session();
                         self.tuner.fft_dirty = true;
                         self.waveform.reset_view_for_new_buffer();
-                        self.sync_engine_buffer();
+                        self.sync_engine_buffer_immediate();
                         self.status_message = "Generated new 1s synthesized buffer".to_string();
                     }
                     TunerAction::StatusMessage(msg) => {
@@ -947,7 +1036,9 @@ impl eframe::App for WavecraftApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let playhead = self.engine.state().playhead_frame();
-            match show_waveform_panel(
+            let prev_channel = self.active_channel;
+            let prev_selection = self.selection.clone();
+            let wave_action = show_waveform_panel(
                 ui,
                 &mut self.editable,
                 &mut self.selection,
@@ -956,22 +1047,40 @@ impl eframe::App for WavecraftApp {
                 self.tuner.wavelength_samples,
                 self.loop_enabled,
                 &mut self.waveform,
-            ) {
+            );
+            if prev_channel != self.active_channel {
+                self.tuner.reset_live_session();
+            }
+            match wave_action {
                 WaveformAction::None => {}
                 WaveformAction::Seek(frame) => {
                     self.engine.seek(frame);
+                    if prev_selection != self.selection {
+                        self.tuner.reset_live_session();
+                        self.tuner.fft_dirty = true;
+                        self.sync_loop_range(true);
+                    }
+                }
+                WaveformAction::SelectionPreviewChanged => {
+                    self.tuner.reset_live_session();
+                    self.tuner.fft_dirty = true;
+                    self.sync_loop_range(false);
                 }
                 WaveformAction::SelectionChanged => {
+                    self.tuner.reset_live_session();
                     self.tuner.fft_dirty = true;
-                    self.sync_loop_range();
+                    self.sync_loop_range(true);
                 }
                 WaveformAction::BufferEdited => {
+                    self.tuner.reset_live_session();
                     self.tuner.fft_dirty = true;
+                    self.sync_engine_buffer_live_throttled();
                 }
                 WaveformAction::EditCommitted => {
                     self.clamp_selection_to_buffer();
+                    self.tuner.reset_live_session();
                     self.tuner.fft_dirty = true;
-                    self.sync_engine_buffer();
+                    self.sync_engine_buffer_immediate();
                 }
             }
         });

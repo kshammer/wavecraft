@@ -135,6 +135,7 @@ impl WaveformViewState {
 pub enum WaveformAction {
     None,
     Seek(usize),
+    SelectionPreviewChanged,
     SelectionChanged,
     BufferEdited,
     EditCommitted,
@@ -646,7 +647,7 @@ pub fn show_waveform_panel(
                     let lo = anchor.min(frame);
                     let hi = anchor.max(frame).min(num_frames);
                     *selection = Some(lo..hi);
-                    action = WaveformAction::SelectionChanged;
+                    action = WaveformAction::SelectionPreviewChanged;
                 } else if wave_resp.drag_stopped() {
                     if let Some(sel) = selection.as_ref()
                         && sel.start >= sel.end
