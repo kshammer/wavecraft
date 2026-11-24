@@ -1,0 +1,10 @@
+[package]
+name = "wavecraft-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+rustfft.workspace = true
+symphonia.workspace = true

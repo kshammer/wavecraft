@@ -1,0 +1,11 @@
+[package]
+name = "wavecraft-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wavecraft-core.workspace = true
+wavecraft-audio.workspace = true
+eframe.workspace = true
+egui.workspace = true

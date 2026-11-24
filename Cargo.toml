@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/wavecraft-core",
+    "crates/wavecraft-audio",
+    "crates/wavecraft-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Wavecraft Contributors"]
+
+[workspace.dependencies]
+wavecraft-core = { path = "crates/wavecraft-core" }
+wavecraft-audio = { path = "crates/wavecraft-audio" }
+thiserror = "2"
+rustfft = "6"
+symphonia = { version = "0.5", default-features = false, features = ["flac", "mp3", "ogg", "vorbis", "pcm", "wav"] }
+eframe = "0.31"
+egui = "0.31"

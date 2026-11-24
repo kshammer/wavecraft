@@ -1,0 +1,9 @@
+[package]
+name = "wavecraft-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wavecraft-core.workspace = true
+thiserror.workspace = true
