@@ -20,6 +20,17 @@ const FREQ_GRID_LINES: [f64; 9] = [
 ];
 const DB_GRID_LINES: [f32; 4] = [-20.0, -40.0, -60.0, -80.0];
 
+/// Converts an optional single-channel index into a bitmask (`1 << ch`),
+/// returning `Some(0)` if `ch >= usize::BITS as usize` so shifting never overflows.
+pub(crate) fn channel_bitmask(active_channel: Option<usize>) -> Option<usize> {
+    active_channel.map(|ch| {
+        u32::try_from(ch)
+            .ok()
+            .and_then(|s| 1usize.checked_shl(s))
+            .unwrap_or(0)
+    })
+}
+
 /// Active tab in the bottom workbench dock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BottomTab {
@@ -900,7 +911,7 @@ fn render_tuner_tab(
             .clicked()
         {
             let range = selection.clone().unwrap_or(0..num_frames);
-            let channel_mask = active_channel.map(|ch| 1usize << ch);
+            let channel_mask = channel_bitmask(active_channel);
             let params = state.synth_params();
             let mode = state.apply_mode;
             editable.apply_transform(|b| {
@@ -943,15 +954,20 @@ fn render_tuner_tab(
                     .filter(|&w| w > 0.0 && w.is_finite())
                     .unwrap_or(clamped.len() as f64);
                 let target_wl = state.wavelength_samples.max(1.0);
-                let old_len = clamped.len();
-                let new_len = ((old_len as f64) * (target_wl / current_wl))
-                    .round()
-                    .max(1.0) as usize;
+                let total_before = num_frames;
+                let sel_len = clamped.len();
                 editable.apply_transform(|b| {
                     resample_region_to_wavelength(b, clamped.clone(), current_wl, target_wl);
                 });
                 let total_after = editable.buffer().num_frames();
-                *selection = Some(start..(start + new_len).min(total_after));
+                let actual_new_len =
+                    total_after.saturating_sub(total_before.saturating_sub(sel_len));
+                let new_end = start.saturating_add(actual_new_len).min(total_after);
+                *selection = if start < new_end {
+                    Some(start..new_end)
+                } else {
+                    None
+                };
                 state.fft_dirty = true;
                 action = TunerAction::BufferEdited;
             }
@@ -972,7 +988,7 @@ fn render_region_dsp_tab(
     let mut action = TunerAction::None;
     let num_frames = editable.buffer().num_frames();
     let target_range = selection.clone().unwrap_or(0..num_frames);
-    let channel_mask = active_channel.map(|ch| 1usize << ch);
+    let channel_mask = channel_bitmask(active_channel);
     let has_sel = selection
         .as_ref()
         .is_some_and(|s| s.start < s.end && s.end <= num_frames);
@@ -1169,5 +1185,14 @@ mod tests {
 
         let cleared = harmonic_preset_amps(HarmonicPreset::Clear);
         assert!(cleared.iter().all(|&a| a == 0.0));
+    }
+
+    #[test]
+    fn channel_bitmask_guards_shift_overflow() {
+        assert_eq!(channel_bitmask(Some(0)), Some(1));
+        assert_eq!(channel_bitmask(Some(1)), Some(2));
+        assert_eq!(channel_bitmask(Some(64)), Some(0));
+        assert_eq!(channel_bitmask(Some(100)), Some(0));
+        assert_eq!(channel_bitmask(None), None);
     }
 }

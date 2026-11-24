@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use egui::{Color32, CornerRadius, Key, Modifiers, Stroke};
+use egui::{Color32, CornerRadius, Key, Stroke};
 use wavecraft_audio::PlaybackEngine;
 use wavecraft_core::dsp::{SynthParams, WaveShape, generate_wave, hz_to_wavelength};
 use wavecraft_core::fixtures::generate_sample_fixtures;
@@ -137,6 +137,16 @@ impl WavecraftApp {
         self.sync_loop_range();
     }
 
+    fn clamp_selection_to_buffer(&mut self) {
+        let num_frames = self.editable.buffer().num_frames();
+        self.selection = clamp_selection(self.selection.take(), num_frames);
+        if let Some(ch) = self.active_channel
+            && ch >= self.editable.buffer().num_channels()
+        {
+            self.active_channel = None;
+        }
+    }
+
     fn sync_loop_range(&self) {
         if !self.loop_enabled {
             self.engine.set_loop_range(None);
@@ -233,6 +243,7 @@ impl WavecraftApp {
             i.key_pressed(Key::Z) && (i.modifiers.ctrl || i.modifiers.mac_cmd) && !i.modifiers.shift
         });
         if undo_pressed && self.editable.undo() {
+            self.clamp_selection_to_buffer();
             self.tuner.fft_dirty = true;
             self.sync_engine_buffer();
             self.status_message = "Undo".to_string();
@@ -243,6 +254,7 @@ impl WavecraftApp {
             mod_cmd && (i.key_pressed(Key::Y) || (i.key_pressed(Key::Z) && i.modifiers.shift))
         });
         if redo_pressed && self.editable.redo() {
+            self.clamp_selection_to_buffer();
             self.tuner.fft_dirty = true;
             self.sync_engine_buffer();
             self.status_message = "Redo".to_string();
@@ -250,8 +262,7 @@ impl WavecraftApp {
 
         let save_pressed = ctx.input(|i| {
             let mod_cmd = i.modifiers.ctrl || i.modifiers.mac_cmd;
-            mod_cmd && i.modifiers.matches_logically(Modifiers::CTRL) && i.key_pressed(Key::S)
-                || (mod_cmd && i.key_pressed(Key::S))
+            mod_cmd && i.key_pressed(Key::S)
         });
         if save_pressed {
             self.open_save_wav_modal();
@@ -376,6 +387,7 @@ impl WavecraftApp {
                         .clicked()
                         && self.editable.undo()
                     {
+                        self.clamp_selection_to_buffer();
                         self.tuner.fft_dirty = true;
                         self.sync_engine_buffer();
                         self.status_message = "Undo".to_string();
@@ -385,6 +397,7 @@ impl WavecraftApp {
                         .clicked()
                         && self.editable.redo()
                     {
+                        self.clamp_selection_to_buffer();
                         self.tuner.fft_dirty = true;
                         self.sync_engine_buffer();
                         self.status_message = "Redo".to_string();
@@ -607,6 +620,8 @@ impl WavecraftApp {
                                         match inspect_file(&out_path, None) {
                                             Ok(inspected) => {
                                                 self.inspected = Some(inspected);
+                                                self.inspector.selected_range = None;
+                                                self.inspector.scroll_to_row = None;
                                                 self.status_message =
                                                     format!("Saved WAV: {}", out_path.display());
                                             }
@@ -891,6 +906,7 @@ impl eframe::App for WavecraftApp {
                 ) {
                     TunerAction::None => {}
                     TunerAction::BufferEdited => {
+                        self.clamp_selection_to_buffer();
                         self.tuner.fft_dirty = true;
                         self.sync_engine_buffer();
                     }
@@ -953,6 +969,7 @@ impl eframe::App for WavecraftApp {
                     self.tuner.fft_dirty = true;
                 }
                 WaveformAction::EditCommitted => {
+                    self.clamp_selection_to_buffer();
                     self.tuner.fft_dirty = true;
                     self.sync_engine_buffer();
                 }
@@ -961,6 +978,15 @@ impl eframe::App for WavecraftApp {
 
         self.render_modals(ctx);
     }
+}
+
+/// Clamps a frame `selection` to `[0, num_frames]`, returning `None` if empty or out of bounds.
+pub fn clamp_selection(selection: Option<Range<usize>>, num_frames: usize) -> Option<Range<usize>> {
+    selection.and_then(|sel| {
+        let start = sel.start.min(num_frames);
+        let end = sel.end.min(num_frames);
+        if start < end { Some(start..end) } else { None }
+    })
 }
 
 /// Builds a deterministic 440 Hz sine [`AudioBuffer`] for initial startup or New Buffer modal.
@@ -1001,4 +1027,25 @@ fn configure_theme(ctx: &egui::Context) {
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(40, 48, 62);
     visuals.widgets.active.bg_fill = Color32::from_rgb(45, 132, 130);
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_selection_handles_valid_partial_oob_and_empty_ranges() {
+        assert_eq!(clamp_selection(Some(10..50), 100), Some(10..50));
+        assert_eq!(clamp_selection(Some(0..100), 100), Some(0..100));
+        assert_eq!(clamp_selection(Some(80..120), 100), Some(80..100));
+        assert_eq!(clamp_selection(Some(100..150), 100), None);
+        assert_eq!(clamp_selection(Some(120..150), 100), None);
+        assert_eq!(clamp_selection(Some(50..50), 100), None);
+        assert_eq!(
+            clamp_selection(Some(Range { start: 60, end: 40 }), 100),
+            None
+        );
+        assert_eq!(clamp_selection(Some(0..10), 0), None);
+        assert_eq!(clamp_selection(None, 100), None);
+    }
 }

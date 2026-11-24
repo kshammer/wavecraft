@@ -356,13 +356,21 @@ pub fn show_waveform_panel(
         {
             *active_channel = None;
         }
-        for ch in 0..num_channels {
+        const MAX_CHANNEL_BUTTONS: usize = 16;
+        for ch in 0..num_channels.min(MAX_CHANNEL_BUTTONS) {
             if ui
                 .selectable_label(*active_channel == Some(ch), format!("Ch {}", ch + 1))
                 .clicked()
             {
                 *active_channel = Some(ch);
             }
+        }
+        if num_channels > MAX_CHANNEL_BUTTONS {
+            ui.label(
+                egui::RichText::new(format!("+{} more", num_channels - MAX_CHANNEL_BUTTONS))
+                    .size(11.0)
+                    .color(Color32::from_rgb(148, 163, 184)),
+            );
         }
 
         ui.separator();
@@ -602,6 +610,7 @@ pub fn show_waveform_panel(
                 if wave_resp.double_clicked()
                     && let Some(pos) = wave_resp.interact_pointer_pos()
                 {
+                    state.drag_select_anchor = None;
                     let raw_f = x_to_frame(
                         pos.x,
                         state.scroll_offset_frames,

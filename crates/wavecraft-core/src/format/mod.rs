@@ -236,8 +236,17 @@ pub fn inspect_file(path: &Path, raw_cfg: Option<RawPcmConfig>) -> Result<Inspec
     inspect_bytes(bytes, Some(path), raw_cfg)
 }
 
+/// Maximum file size (64 MiB) eligible for automatic explorer waveform preview.
+pub const MAX_PREVIEW_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Lightweight explorer preview helper returning file metadata and overview waveform peak buckets.
 pub fn probe_preview(path: &Path, num_buckets: usize) -> Result<(AudioMetadata, Vec<PeakBucket>)> {
+    let file_len = std::fs::metadata(path)?.len();
+    if file_len > MAX_PREVIEW_FILE_BYTES {
+        return Err(CoreError::UnsupportedFormat(
+            "file too large for auto-preview (>64 MiB)".into(),
+        ));
+    }
     let inspected = inspect_file(path, None)?;
     let peaks = if num_buckets == 0 || inspected.buffer.is_empty() {
         Vec::new()
@@ -457,6 +466,12 @@ mod tests {
         assert_eq!(meta.format, AudioFormat::Wav);
         assert_eq!(meta.num_frames, 6);
         assert_eq!(peaks.len(), 3);
+
+        let large_path = dir.join("too_large.wav");
+        let large_file = std::fs::File::create(&large_path).unwrap();
+        large_file.set_len(MAX_PREVIEW_FILE_BYTES + 1).unwrap();
+        let err = probe_preview(&large_path, 3).unwrap_err();
+        assert!(matches!(err, CoreError::UnsupportedFormat(_)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

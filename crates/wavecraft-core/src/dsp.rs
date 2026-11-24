@@ -247,6 +247,38 @@ pub fn apply_synth_to_buffer(
     }
 }
 
+/// Maximum number of frames allocated by [`resample_region_to_wavelength`] (~6 minutes at 44.1 kHz).
+pub const MAX_RESAMPLED_FRAMES: usize = 16_000_000;
+
+/// Computes the clamped output frame count for resampling `old_len` frames from
+/// `current_wavelength` to `target_wavelength`, returning `None` for invalid or non-finite inputs.
+pub fn capped_resampled_len(
+    old_len: usize,
+    current_wavelength: f64,
+    target_wavelength: f64,
+) -> Option<usize> {
+    if old_len == 0
+        || current_wavelength <= 0.0
+        || target_wavelength <= 0.0
+        || !current_wavelength.is_finite()
+        || !target_wavelength.is_finite()
+    {
+        return None;
+    }
+
+    let ratio = target_wavelength / current_wavelength;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+
+    let scaled = (old_len as f64) * ratio;
+    if !scaled.is_finite() || scaled >= MAX_RESAMPLED_FRAMES as f64 {
+        Some(MAX_RESAMPLED_FRAMES)
+    } else {
+        Some((scaled.round() as usize).clamp(1, MAX_RESAMPLED_FRAMES))
+    }
+}
+
 /// Linearly resamples the selected `range` across all channels to shift its wavelength
 /// from `current_wavelength` to `target_wavelength`, replacing `range` in the buffer.
 pub fn resample_region_to_wavelength(
@@ -257,21 +289,10 @@ pub fn resample_region_to_wavelength(
 ) {
     let clamped = buf.clamp_range(range);
     let old_len = clamped.len();
-    if old_len == 0
-        || current_wavelength <= 0.0
-        || target_wavelength <= 0.0
-        || !current_wavelength.is_finite()
-        || !target_wavelength.is_finite()
-    {
+    let Some(new_len) = capped_resampled_len(old_len, current_wavelength, target_wavelength) else {
         return;
-    }
-
+    };
     let ratio = target_wavelength / current_wavelength;
-    let new_len_f = (old_len as f64 * ratio).round();
-    if !new_len_f.is_finite() {
-        return;
-    }
-    let new_len = (new_len_f as usize).max(1);
 
     for ch in &mut buf.channels {
         let src = &ch[clamped.clone()];
@@ -669,6 +690,37 @@ mod tests {
             (detected - expected_hz).abs() < 3.0,
             "expected ~{expected_hz} Hz, got {detected} Hz"
         );
+    }
+
+    #[test]
+    fn resample_caps_extreme_ratios_and_guards_invalid_inputs() {
+        assert_eq!(
+            capped_resampled_len(100, 1e-9, 1e9),
+            Some(MAX_RESAMPLED_FRAMES)
+        );
+        assert_eq!(
+            capped_resampled_len(100, 1.0, f64::MAX),
+            Some(MAX_RESAMPLED_FRAMES)
+        );
+        assert_eq!(capped_resampled_len(100, 1e9, 1e-9), Some(1));
+        assert_eq!(capped_resampled_len(0, 100.0, 50.0), None);
+        assert_eq!(capped_resampled_len(100, 0.0, 50.0), None);
+        assert_eq!(capped_resampled_len(100, 100.0, -5.0), None);
+        assert_eq!(capped_resampled_len(100, f64::NAN, 50.0), None);
+        assert_eq!(capped_resampled_len(100, 1e-308, 1e308), None);
+
+        // Resampling a small region with a moderate ratio and invalid ratio leaves buffer valid
+        let mut buf = AudioBuffer::from_channels(
+            44100,
+            vec![vec![0.0, 0.5, 1.0, 0.5]],
+            SampleEncoding::Float32,
+        )
+        .unwrap();
+        resample_region_to_wavelength(&mut buf, 0..4, 10.0, 20.0);
+        assert_eq!(buf.num_frames(), 8);
+
+        resample_region_to_wavelength(&mut buf, 0..4, 1e-308, 1e308);
+        assert_eq!(buf.num_frames(), 8);
     }
 
     #[test]
